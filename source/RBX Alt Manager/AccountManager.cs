@@ -92,11 +92,13 @@ namespace RBX_Alt_Manager
         private CancellationTokenSource LauncherToken;
         private System.Timers.Timer PresenceTimer;
         private System.Timers.Timer LiveStatusTimer;
+        private System.Timers.Timer LastSeenTimer;
         private readonly static Regex BrowserTrackerRegex = new Regex(@"(?:\-b\s+|browsertrackerid[:=])(\d+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
         private int PresenceUpdateInProgress;
         private int LiveStatusUpdateInProgress;
         private DateTime LastOpenInstancePresenceUpdate = DateTime.MinValue;
         private OLVColumn CurrentGameColumn;
+        private OLVColumn LastSeenColumn;
         private readonly ConcurrentDictionary<long, string> PlaceNameCache = new ConcurrentDictionary<long, string>();
         private readonly ConcurrentDictionary<long, byte> PlaceNameLookups = new ConcurrentDictionary<long, byte>();
         private readonly ConcurrentDictionary<long, ScriptLiveStatusOverride> ScriptLiveStatusOverrides = new ConcurrentDictionary<long, ScriptLiveStatusOverride>();
@@ -202,6 +204,7 @@ namespace RBX_Alt_Manager
             InitializeComponent();
             this.Rescale();
             SetupAccountGameColumn();
+            SetupAccountLastSeenColumn();
 
             AccountsList = new List<Account>();
             SelectedAccounts = new List<Account>();
@@ -273,6 +276,54 @@ namespace RBX_Alt_Manager
 
             AccountsView.AllColumns.Insert(1, CurrentGameColumn);
             AccountsView.Columns.Insert(1, CurrentGameColumn);
+        }
+
+        private static string FormatLastSeenAge(DateTime LastSeenUtc)
+        {
+            if (LastSeenUtc == DateTime.MinValue)
+                return string.Empty;
+
+            TimeSpan Age = DateTime.UtcNow - LastSeenUtc;
+            if (Age < TimeSpan.Zero)
+                Age = TimeSpan.Zero;
+
+            if (Age.TotalSeconds < 60)
+                return $"{Math.Max(0, (int)Age.TotalSeconds)}s ago";
+
+            if (Age.TotalMinutes < 60)
+                return $"{(int)Age.TotalMinutes}m ago";
+
+            if (Age.TotalHours < 24)
+                return $"{(int)Age.TotalHours}h ago";
+
+            return $"{(int)Age.TotalDays}d ago";
+        }
+
+        private string GetLastSeenText(Account account)
+        {
+            if (account == null) return string.Empty;
+            if (account.LastLiveStatusUpdateUtc == DateTime.MinValue)
+                return account.HasOpenInstance ? "No signal" : string.Empty;
+
+            return FormatLastSeenAge(account.LastLiveStatusUpdateUtc);
+        }
+
+        private void SetupAccountLastSeenColumn()
+        {
+            if (AccountsView.AllColumns.Any(column => string.Equals(column.Text, "Last Seen", StringComparison.OrdinalIgnoreCase)))
+                return;
+
+            LastSeenColumn = new OLVColumn("Last Seen", "LastLiveStatusUpdateUtc")
+            {
+                IsEditable = false,
+                Sortable = false,
+                Width = (int)(90 * Program.Scale)
+            };
+
+            LastSeenColumn.AspectGetter = rowObject => rowObject is Account account ? GetLastSeenText(account) : string.Empty;
+
+            AccountsView.AllColumns.Insert(2, LastSeenColumn);
+            AccountsView.Columns.Insert(2, LastSeenColumn);
         }
 
         private void Sink_CanDrop(object sender, OlvDropEventArgs e)
@@ -857,6 +908,9 @@ namespace RBX_Alt_Manager
             LiveStatusTimer = new System.Timers.Timer(2000) { AutoReset = true, Enabled = true };
             LiveStatusTimer.Elapsed += async (s, e) => await TryUpdateLiveStatus();
 
+            LastSeenTimer = new System.Timers.Timer(1000) { AutoReset = true, Enabled = true };
+            LastSeenTimer.Elapsed += (s, e) => RefreshLastSeenColumn();
+
             _ = TryUpdateLiveStatus(true);
             _ = TryUpdatePresence();
         }
@@ -988,9 +1042,13 @@ namespace RBX_Alt_Manager
         {
             GameChanged = false;
             if (account == null || Override == null) return false;
+            account.LastLiveStatusUpdateUtc = Override.UpdatedAtUtc;
 
             bool OverrideIsOnServer = Override.IsOnServer;
-            if (OverrideIsOnServer && !Override.PlaceId.HasValue && string.IsNullOrWhiteSpace(Override.GameName))
+            bool OverrideHasResolvedGame = (Override.PlaceId.HasValue && Override.PlaceId.Value > 0)
+                || (!string.IsNullOrWhiteSpace(Override.GameName) && !string.Equals(Override.GameName, "Loading...", StringComparison.OrdinalIgnoreCase));
+
+            if (OverrideIsOnServer && !OverrideHasResolvedGame)
                 OverrideIsOnServer = false;
 
             bool StateChanged = account.HasOpenInstance != Override.HasOpenInstance || account.IsOnServer != OverrideIsOnServer;
@@ -1032,14 +1090,18 @@ namespace RBX_Alt_Manager
             return StateChanged;
         }
 
+        private static bool HasResolvedGame(Account account)
+        {
+            return account != null
+                && (account.CurrentPlaceId.HasValue
+                    || (!string.IsNullOrWhiteSpace(account.CurrentGameName) && !string.Equals(account.CurrentGameName, "Loading...", StringComparison.OrdinalIgnoreCase)));
+        }
+
         private static bool IsAccountInGame(Account account)
         {
             if (account == null) return false;
 
-            bool HasResolvedGame = account.CurrentPlaceId.HasValue
-                || (!string.IsNullOrWhiteSpace(account.CurrentGameName) && !string.Equals(account.CurrentGameName, "Loading...", StringComparison.OrdinalIgnoreCase));
-
-            bool ScriptInGame = account.IsOnServer && HasResolvedGame;
+            bool ScriptInGame = account.HasOpenInstance && account.IsOnServer && HasResolvedGame(account);
             bool PresenceInGame = account.Presence?.userPresenceType == UserPresenceType.InGame && GetPresencePlaceId(account).HasValue;
 
             return ScriptInGame || PresenceInGame;
@@ -1124,6 +1186,10 @@ namespace RBX_Alt_Manager
 
                 AutoRejoinState State = AutoRejoinStates.GetOrAdd(account.UserID, _ => new AutoRejoinState());
                 bool InGame = IsAccountInGame(account);
+                DateTime? LastSignalUtc = account.LastLiveStatusUpdateUtc != DateTime.MinValue ? account.LastLiveStatusUpdateUtc : (DateTime?)null;
+
+                if (LastSignalUtc.HasValue && (NowUtc - LastSignalUtc.Value) > AutoRejoinOfflineThreshold)
+                    InGame = false;
 
                 if (account.HasOpenInstance || InGame)
                     State.HasSeenActiveSession = true;
@@ -1140,7 +1206,7 @@ namespace RBX_Alt_Manager
                     continue;
                 }
 
-                State.OfflineSinceUtc ??= NowUtc;
+                State.OfflineSinceUtc ??= LastSignalUtc ?? NowUtc;
 
                 if ((NowUtc - State.OfflineSinceUtc.Value) < AutoRejoinOfflineThreshold)
                     continue;
@@ -1304,7 +1370,7 @@ namespace RBX_Alt_Manager
                     ?? Payload?["gameName"]?.Value<string>();
 
                 bool HasOpenInstance = ParseBoolean(HasOpenInstanceValue, true);
-                bool IsOnServer = ParseBoolean(IsOnServerValue, true);
+                bool IsOnServer = ParseBoolean(IsOnServerValue, false);
                 long? PlaceId = ParseNullableLong(PlaceIdValue);
 
                 if (!IsOnServer)
@@ -1513,7 +1579,7 @@ namespace RBX_Alt_Manager
                         && string.Equals(LocalReleaseTag, LatestReleaseTag, StringComparison.OrdinalIgnoreCase))
                         return;
 
-                    InvokeIfRequired(() =>
+                    this.InvokeIfRequired(() =>
                     {
                         if (!Utilities.YesNoPrompt("Roblox Account Manager", $"Custom update available ({LatestReleaseTag})", "Would you like to install it now?", false))
                             return;
@@ -2001,6 +2067,12 @@ namespace RBX_Alt_Manager
             }
 
             AltManagerWS?.Stop();
+            LastSeenTimer?.Stop();
+            LastSeenTimer?.Dispose();
+            LiveStatusTimer?.Stop();
+            LiveStatusTimer?.Dispose();
+            PresenceTimer?.Stop();
+            PresenceTimer?.Dispose();
 
             if (PlaceID == null || string.IsNullOrEmpty(PlaceID.Text)) return;
 
@@ -2626,6 +2698,22 @@ namespace RBX_Alt_Manager
             return VisibleAccounts;
         }
 
+        private void RefreshLastSeenColumn()
+        {
+            if (AccountsView == null || AccountsView.IsDisposed || !IsHandleCreated)
+                return;
+
+            AccountsView.InvokeIfRequired(() =>
+            {
+                if (AccountsView.IsDisposed)
+                    return;
+
+                List<Account> Visible = GetVisibleAccounts();
+                if (Visible.Count > 0)
+                    AccountsView.RefreshObjects(Visible);
+            });
+        }
+
         private static long? GetPresencePlaceId(Account account)
         {
             if (account?.Presence == null) return null;
@@ -2689,9 +2777,11 @@ namespace RBX_Alt_Manager
 
             foreach (Account account in Accounts)
             {
-                long? PlaceId = GetPresencePlaceId(account);
-                bool PresenceInGame = account.Presence?.userPresenceType == UserPresenceType.InGame && PlaceId.HasValue;
-                bool InGame = account.IsOnServer || PresenceInGame;
+                long? PresencePlaceId = GetPresencePlaceId(account);
+                long? PlaceId = PresencePlaceId ?? account.CurrentPlaceId;
+                bool PresenceInGame = account.Presence?.userPresenceType == UserPresenceType.InGame && PresencePlaceId.HasValue;
+                bool ScriptInGame = account.HasOpenInstance && account.IsOnServer && HasResolvedGame(account);
+                bool InGame = ScriptInGame || PresenceInGame;
                 string GameName = string.Empty;
 
                 if (InGame)
@@ -2763,7 +2853,13 @@ namespace RBX_Alt_Manager
                     HasOpenInstance = true;
 
                     if (ServerState.HasValue)
-                        IsOnServer = ServerState.Value;
+                    {
+                        long? PresencePlaceId = GetPresencePlaceId(account);
+                        IsOnServer = ServerState.Value && (PresencePlaceId.HasValue || HasResolvedGame(account));
+
+                        if (!PresencePlaceId.HasValue)
+                            PresenceFallback.Add(account);
+                    }
                     else
                     {
                         long? PresencePlaceId = GetPresencePlaceId(account);

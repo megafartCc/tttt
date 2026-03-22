@@ -39,6 +39,7 @@ namespace RBX_Alt_Manager
         [JsonIgnore] public bool IsOnServer;
         [JsonIgnore] public long? CurrentPlaceId;
         [JsonIgnore] public string CurrentGameName = string.Empty;
+        [JsonIgnore] public DateTime LastLiveStatusUpdateUtc = DateTime.MinValue;
 
         [DllImport("user32.dll", SetLastError = true)]
         static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
@@ -703,11 +704,16 @@ namespace RBX_Alt_Manager
 
         public async void AdjustWindowPosition()
         {
+            int SavedPosX = 0;
+            int SavedPosY = 0;
+            int SavedWidth = 0;
+            int SavedHeight = 0;
+
             bool HasSavedWindowPosition = RobloxWatcher.RememberWindowPositions
-                && int.TryParse(GetField("Window_Position_X"), out int SavedPosX)
-                && int.TryParse(GetField("Window_Position_Y"), out int SavedPosY)
-                && int.TryParse(GetField("Window_Width"), out int SavedWidth)
-                && int.TryParse(GetField("Window_Height"), out int SavedHeight);
+                && int.TryParse(GetField("Window_Position_X"), out SavedPosX)
+                && int.TryParse(GetField("Window_Position_Y"), out SavedPosY)
+                && int.TryParse(GetField("Window_Width"), out SavedWidth)
+                && int.TryParse(GetField("Window_Height"), out SavedHeight);
 
             int PosX = HasSavedWindowPosition ? SavedPosX : TinyLaunchPosX;
             int PosY = HasSavedWindowPosition ? SavedPosY : TinyLaunchPosY;

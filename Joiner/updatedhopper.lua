@@ -1468,7 +1468,11 @@ local function pushLiveStatusToRam(force, inGameOverride)
 
     local detectedPlaceId = tonumber(game.PlaceId)
     local detectedJobId = tostring(game.JobId or "")
-    local detectedInGame = (detectedPlaceId or 0) > 0 and detectedJobId ~= ""
+    local okLoaded, detectedLoaded = pcall(function()
+        return game:IsLoaded()
+    end)
+    detectedLoaded = okLoaded and detectedLoaded == true
+    local detectedInGame = detectedLoaded and (detectedPlaceId or 0) > 0 and detectedJobId ~= ""
 
     local inGame = inGameOverride
     if type(inGame) ~= "boolean" then
