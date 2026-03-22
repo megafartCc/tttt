@@ -105,8 +105,7 @@ namespace RBX_Alt_Manager
         private readonly ConcurrentDictionary<long, ScriptLiveStatusOverride> ScriptLiveStatusOverrides = new ConcurrentDictionary<long, ScriptLiveStatusOverride>();
         private static readonly TimeSpan ScriptLiveStatusOverrideTtl = TimeSpan.FromSeconds(15);
         private const long AutoRejoinPlaceId = 109983668079237;
-        private static readonly TimeSpan AutoRejoinOfflineThreshold = TimeSpan.FromSeconds(130);
-        private static readonly TimeSpan AutoRejoinOpenInstanceGrace = TimeSpan.FromSeconds(30);
+        private static readonly TimeSpan AutoRejoinOfflineThreshold = TimeSpan.FromSeconds(105);
         private static readonly TimeSpan AutoRejoinRetryCooldown = TimeSpan.FromSeconds(30);
         private readonly ConcurrentDictionary<long, AutoRejoinState> AutoRejoinStates = new ConcurrentDictionary<long, AutoRejoinState>();
         private readonly ConcurrentDictionary<long, byte> AutoRejoinInProgress = new ConcurrentDictionary<long, byte>();
@@ -1100,9 +1099,25 @@ namespace RBX_Alt_Manager
                     || (!string.IsNullOrWhiteSpace(account.CurrentGameName) && !string.Equals(account.CurrentGameName, "Loading...", StringComparison.OrdinalIgnoreCase)));
         }
 
+        public static bool HasFreshLiveSignal(Account account, DateTime? nowUtc = null)
+        {
+            if (account == null || account.LastLiveStatusUpdateUtc == DateTime.MinValue)
+                return false;
+
+            DateTime now = nowUtc ?? DateTime.UtcNow;
+            TimeSpan age = now - account.LastLiveStatusUpdateUtc;
+            if (age < TimeSpan.Zero)
+                age = TimeSpan.Zero;
+
+            return age <= AutoRejoinOfflineThreshold;
+        }
+
         private static bool IsAccountInGame(Account account)
         {
             if (account == null) return false;
+
+            if (!HasFreshLiveSignal(account))
+                return false;
 
             bool ScriptInGame = account.HasOpenInstance && account.IsOnServer && HasResolvedGame(account);
             bool PresenceInGame = account.Presence?.userPresenceType == UserPresenceType.InGame && GetPresencePlaceId(account).HasValue;
@@ -1194,37 +1209,27 @@ namespace RBX_Alt_Manager
                 bool InGame = IsAccountInGame(account);
                 DateTime? LastSignalUtc = account.LastLiveStatusUpdateUtc != DateTime.MinValue ? account.LastLiveStatusUpdateUtc : (DateTime?)null;
                 bool ManagedAccount = !string.IsNullOrEmpty(account.BrowserTrackerID);
-                TimeSpan EffectiveOfflineThreshold = AutoRejoinOfflineThreshold;
-                if (account.HasOpenInstance && !InGame)
-                    EffectiveOfflineThreshold = AutoRejoinOfflineThreshold + AutoRejoinOpenInstanceGrace;
-
-                bool SignalStale = LastSignalUtc.HasValue && (NowUtc - LastSignalUtc.Value) > EffectiveOfflineThreshold;
+                bool HasFreshSignal = LastSignalUtc.HasValue && (NowUtc - LastSignalUtc.Value) <= AutoRejoinOfflineThreshold;
+                bool SignalStale = LastSignalUtc.HasValue && !HasFreshSignal;
                 bool MissingSignal = !LastSignalUtc.HasValue;
 
                 if (account.HasOpenInstance || InGame || LastSignalUtc.HasValue || ManagedAccount)
                     State.HasSeenActiveSession = true;
 
-                // In-game with a fresh signal should never be auto-rejoined.
-                if (InGame && !SignalStale)
+                // Any fresh signal means the instance is alive; do not run rejoin timer.
+                if (HasFreshSignal)
                 {
                     State.OfflineSinceUtc = null;
                     continue;
                 }
 
-                // Start/reuse offline timer once account is not actively in-game.
-                // If we still have an open instance but signal is stale, start from "now"
-                // to avoid immediate false relaunches after report gaps/restarts.
+                // Start offline timer from the last signal timestamp (or now if there is none).
                 if (!State.OfflineSinceUtc.HasValue)
                 {
-                    if (MissingSignal)
-                        State.OfflineSinceUtc = NowUtc;
-                    else if (account.HasOpenInstance && SignalStale)
-                        State.OfflineSinceUtc = NowUtc;
-                    else
-                        State.OfflineSinceUtc = LastSignalUtc ?? NowUtc;
+                    State.OfflineSinceUtc = LastSignalUtc ?? NowUtc;
                 }
 
-                if ((NowUtc - State.OfflineSinceUtc.Value) < EffectiveOfflineThreshold)
+                if ((NowUtc - State.OfflineSinceUtc.Value) < AutoRejoinOfflineThreshold)
                     continue;
 
                 if ((NowUtc - State.LastAttemptUtc) < AutoRejoinRetryCooldown)

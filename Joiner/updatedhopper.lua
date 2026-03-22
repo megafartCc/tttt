@@ -109,6 +109,8 @@ local SHARED_SERVER_BLOCK_SECONDS = 300
 local SHARED_IGNORE_REFRESH_SECONDS = 0.5
 local SHARED_SERVER_CLAIM_WAIT_SECONDS = 0.08
 local SHARED_SERVER_CLAIM_FILE_PREFIX = "server_claim_" .. tostring(TargetPlaceId) .. "_"
+local SHARED_SERVER_CLAIM_FILE = "server_claims_shared_" .. tostring(TargetPlaceId) .. ".json"
+local CLEANUP_LEGACY_SERVER_CLAIM_FILES = true
 
 local API = "https://games.roblox.com/v1/games/" .. tostring(TargetPlaceId) .. "/servers/Public?limit=100"
 
@@ -919,54 +921,141 @@ local function sanitizeJobIdForFile(jobId)
     return tostring(jobId or ""):gsub("[^%w%-_]", "_")
 end
 
-local function getSharedServerClaimFile(jobId)
-    return SHARED_SERVER_CLAIM_FILE_PREFIX .. sanitizeJobIdForFile(jobId) .. ".json"
+local function cleanupLegacySharedServerClaimFiles()
+    if not CLEANUP_LEGACY_SERVER_CLAIM_FILES then
+        return
+    end
+    if type(listfiles) ~= "function" or type(delfile) ~= "function" then
+        return
+    end
+
+    local okList, files = pcall(listfiles, ".")
+    if not okList or type(files) ~= "table" then
+        return
+    end
+
+    local deleted = 0
+    for _, filePath in ipairs(files) do
+        local fileName = tostring(filePath or ""):gsub("\\", "/"):match("([^/]+)$") or tostring(filePath or "")
+        if type(fileName) == "string"
+            and fileName ~= ""
+            and fileName ~= SHARED_SERVER_CLAIM_FILE
+            and fileName:sub(1, #SHARED_SERVER_CLAIM_FILE_PREFIX) == SHARED_SERVER_CLAIM_FILE_PREFIX
+            and fileName:sub(-5) == ".json" then
+            local okDelete = pcall(function()
+                delfile(filePath)
+            end)
+            if okDelete then
+                deleted = deleted + 1
+                if (deleted % 100) == 0 then
+                    task.wait()
+                end
+            end
+        end
+    end
+
+    if deleted > 0 then
+        warn("[Joiner Hopper] Removed legacy claim files: " .. tostring(deleted))
+    end
 end
 
-local function writeSharedServerClaim(jobId)
-    local payload = {
+local function readSharedServerClaimStore()
+    local store = {
         gameId = TargetPlaceId,
-        jobId = tostring(jobId or ""),
-        owner = SHARED_SERVER_CLAIM_OWNER,
-        expiresAt = getNowSeconds() + math.max(1, tonumber(SHARED_SERVER_BLOCK_SECONDS) or JOINER_SERVER_BLOCK_SECONDS),
+        claims = {},
     }
 
-    local okEncode, encoded = pcall(HttpService.JSONEncode, HttpService, payload)
+    if type(isfile) ~= "function" or not isfile(SHARED_SERVER_CLAIM_FILE) then
+        return store
+    end
+
+    local okDecode, decoded = pcall(function()
+        return HttpService:JSONDecode(readfile(SHARED_SERVER_CLAIM_FILE))
+    end)
+    if not okDecode or type(decoded) ~= "table" then
+        return store
+    end
+    if tonumber(decoded.gameId) ~= tonumber(TargetPlaceId) then
+        return store
+    end
+
+    local claims = decoded.claims
+    if type(claims) ~= "table" then
+        claims = {}
+    end
+
+    local nowSeconds = getNowSeconds()
+    local cleaned = {}
+    for jobId, payload in pairs(claims) do
+        if type(jobId) == "string" and jobId ~= "" and type(payload) == "table" then
+            local owner = tostring(payload.owner or "")
+            local expiresAt = tonumber(payload.expiresAt)
+            if owner ~= "" and type(expiresAt) == "number" and expiresAt > nowSeconds then
+                cleaned[jobId] = {
+                    owner = owner,
+                    expiresAt = expiresAt,
+                }
+            end
+        end
+    end
+
+    store.claims = cleaned
+    return store
+end
+
+local function writeSharedServerClaimStore(store)
+    if type(store) ~= "table" then
+        return false
+    end
+
+    store.gameId = TargetPlaceId
+    if type(store.claims) ~= "table" then
+        store.claims = {}
+    end
+
+    local okEncode, encoded = pcall(HttpService.JSONEncode, HttpService, store)
     if not okEncode or type(encoded) ~= "string" then
         return false
     end
 
-    local claimFile = getSharedServerClaimFile(jobId)
     local okWrite = pcall(function()
-        writefile(claimFile, encoded)
+        writefile(SHARED_SERVER_CLAIM_FILE, encoded)
     end)
     return okWrite
 end
 
+local function writeSharedServerClaim(jobId)
+    jobId = tostring(jobId or "")
+    if jobId == "" then
+        return false
+    end
+
+    local store = readSharedServerClaimStore()
+    store.claims[jobId] = {
+        owner = SHARED_SERVER_CLAIM_OWNER,
+        expiresAt = getNowSeconds() + math.max(1, tonumber(SHARED_SERVER_BLOCK_SECONDS) or JOINER_SERVER_BLOCK_SECONDS),
+    }
+    return writeSharedServerClaimStore(store)
+end
+
 local function isSharedServerClaimOwnedBySelf(jobId)
-    local claimFile = getSharedServerClaimFile(jobId)
-    if not isfile(claimFile) then
+    jobId = tostring(jobId or "")
+    if jobId == "" then
         return false
     end
 
-    local okDecode, decoded = pcall(function()
-        return HttpService:JSONDecode(readfile(claimFile))
-    end)
-    if not okDecode or type(decoded) ~= "table" then
+    local store = readSharedServerClaimStore()
+    local claim = store.claims[jobId]
+    if type(claim) ~= "table" then
         return false
     end
 
-    if tonumber(decoded.gameId) ~= tonumber(TargetPlaceId) then
-        return false
-    end
-    if tostring(decoded.jobId or "") ~= tostring(jobId or "") then
-        return false
-    end
-    if type(decoded.expiresAt) ~= "number" or decoded.expiresAt <= getNowSeconds() then
+    local expiresAt = tonumber(claim.expiresAt)
+    if type(expiresAt) ~= "number" or expiresAt <= getNowSeconds() then
         return false
     end
 
-    return tostring(decoded.owner or "") == SHARED_SERVER_CLAIM_OWNER
+    return tostring(claim.owner or "") == SHARED_SERVER_CLAIM_OWNER
 end
 
 local function loadIgnoreList()
@@ -2381,6 +2470,7 @@ end
 -- ------------------------------
 loadIgnoreList()
 markServerBlockedForever(tostring(game.JobId or ""))
+cleanupLegacySharedServerClaimFiles()
 
 task.spawn(function()
     while task.wait(JOINER_REPORT_INTERVAL) do
