@@ -62,6 +62,14 @@ namespace RBX_Alt_Manager
 
             try
             {
+                string ExecutableDirectory = Path.GetDirectoryName(Application.ExecutablePath);
+                if (!string.IsNullOrWhiteSpace(ExecutableDirectory) && Directory.Exists(ExecutableDirectory))
+                    Directory.SetCurrentDirectory(ExecutableDirectory);
+            }
+            catch { }
+
+            try
+            {
                 if (Directory.GetParent(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location)).FullName.Contains(Path.GetTempPath().Remove(Path.GetTempPath().Length - 1)))
                 {
                     MessageBox.Show("Roblox Account Manager must be extracted in order to function correctly!", "Roblox Account Manager", MessageBoxButtons.OK);

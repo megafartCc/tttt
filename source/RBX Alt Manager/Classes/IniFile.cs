@@ -138,6 +138,7 @@ namespace RBX_Alt_Manager
     {
         private object SaveObject = new object();
         private readonly IDictionary<string, IniSection> _sections;
+        private string _filePath;
 
         /// <summary>
         /// If True, writes extra spacing between the property name and the property value.
@@ -170,7 +171,8 @@ namespace RBX_Alt_Manager
         /// <param name="path">Path to the INI file.</param>
         public IniFile(string path) : this()
         {
-            Load(path);
+            _filePath = ResolvePath(path);
+            Load(_filePath);
         }
 
         /// <summary>
@@ -182,9 +184,24 @@ namespace RBX_Alt_Manager
             Load(reader);
         }
 
+        private static string ResolvePath(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+                return path;
+
+            if (Path.IsPathRooted(path))
+                return path;
+
+            string BasePath = AppContext.BaseDirectory;
+            if (string.IsNullOrWhiteSpace(BasePath))
+                BasePath = Environment.CurrentDirectory;
+
+            return Path.Combine(BasePath, path);
+        }
+
         private void Load(string path)
         {
-            using (var file = new StreamReader(Path.Combine(Environment.CurrentDirectory, path)))
+            using (var file = new StreamReader(path))
                 Load(file);
         }
 
@@ -261,16 +278,24 @@ namespace RBX_Alt_Manager
         /// <param name="path">Path to the INI file to create.</param>
         public void Save(string path)
         {
-            if (string.IsNullOrEmpty(Environment.CurrentDirectory))
+            string ResolvedPath = ResolvePath(string.IsNullOrWhiteSpace(path) ? _filePath : path);
+
+            if (string.IsNullOrWhiteSpace(ResolvedPath))
             {
-                Program.Logger.Error($"Can not save {path}, CurrentDirectory does not exist");
+                Program.Logger.Error($"Can not save {path}, path is invalid");
 
                 return;
             }
 
             lock (SaveObject)
             {
-                using (var file = new StreamWriter(Path.Combine(Environment.CurrentDirectory, path)))
+                string DirectoryPath = Path.GetDirectoryName(ResolvedPath);
+                if (!string.IsNullOrWhiteSpace(DirectoryPath) && !Directory.Exists(DirectoryPath))
+                    Directory.CreateDirectory(DirectoryPath);
+
+                _filePath = ResolvedPath;
+
+                using (var file = new StreamWriter(ResolvedPath))
                     Save(file);
             }
         }

@@ -144,7 +144,8 @@ namespace RBX_Alt_Manager
 
             SetDarkBar(Handle);
 
-            IniSettings = File.Exists(Path.Combine(Environment.CurrentDirectory, "RAMSettings.ini")) ? new IniFile("RAMSettings.ini") : new IniFile();
+            string SettingsPath = Path.Combine(AppContext.BaseDirectory, "RAMSettings.ini");
+            IniSettings = File.Exists(SettingsPath) ? new IniFile(SettingsPath) : new IniFile();
 
             General = IniSettings.Section("General");
             Developer = IniSettings.Section("Developer");
