@@ -27,7 +27,7 @@ namespace RBX_Alt_Manager.Classes
             public int Bottom;
         }
 
-        public static readonly string HandlePath = Path.Combine(Environment.CurrentDirectory, "handle.bin");
+        public static readonly string HandlePath = Path.Combine(AppContext.BaseDirectory, "handle.bin");
 
         public static HashSet<int> Seen = new HashSet<int>();
         public static List<RobloxProcess> Instances = new List<RobloxProcess>();
