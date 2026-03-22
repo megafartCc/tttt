@@ -32,7 +32,7 @@ namespace RBX_Alt_Manager.Forms
                 Text = "Auto Rejoin"
             };
 
-            Helper.SetToolTip(AutoRejoinCB, $"If an active account is not in-game for 30 seconds, RAM relaunches it to place {AutoRejoinPlaceId}.");
+            Helper.SetToolTip(AutoRejoinCB, $"If an active account has no in-game signal for 60 seconds, RAM relaunches it to place {AutoRejoinPlaceId}.");
             AutoRejoinCB.CheckedChanged += AutoRejoinCB_CheckedChanged;
 
             int InsertAfter = SettingsLayoutPanel.Controls.IndexOf(AutoCookieRefreshCB);
@@ -188,11 +188,13 @@ namespace RBX_Alt_Manager.Forms
 
         private void MultiRobloxCB_CheckedChanged(object sender, EventArgs e)
         {
+            if (!SettingsLoaded) return;
+
             AccountManager.General.Set("EnableMultiRbx", MultiRobloxCB.Checked ? "true" : "false");
             AccountManager.IniSettings.Save("RAMSettings.ini");
 
             if (!AccountManager.Instance.UpdateMultiRoblox())
-                MessageBox.Show("Roblox is currently running, multi roblox will not work if roblox is open.", "Roblox Account Manager", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("Multi Roblox could not be enabled right now.\nRAM will retry automatically when you launch multiple accounts.\nIf it keeps failing, run RAM as admin once and toggle this setting again.", "Roblox Account Manager", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
 
         private void AutoCookieRefreshCB_CheckedChanged(object sender, EventArgs e)

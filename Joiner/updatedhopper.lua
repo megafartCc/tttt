@@ -49,6 +49,8 @@ local RAM_STATUS_PUSH_ENABLED = true
 local RAM_STATUS_PUSH_INTERVAL = 1
 local RAM_STATUS_PUSH_PORT = 7963
 local RAM_STATUS_PUSH_PASSWORD = ""
+local RAM_SERVER_CLAIM_ENABLED = true
+local RAM_SERVER_CLAIM_LEASE_SECONDS = 300
 
 -- Rejoin handling (for bad target server / unavailable server prompts)
 local AUTO_REJOIN_ON_TELEPORT_FAIL = false
@@ -976,6 +978,101 @@ local function loadIgnoreList()
     persistIgnoreList()
 end
 
+local function urlEncodeBasic(text)
+    return tostring(text or ""):gsub("([^%w%-_%.~])", function(char)
+        return string.format("%%%02X", string.byte(char))
+    end)
+end
+
+local function getRamServerClaimEndpoint()
+    local base = "http://localhost:" .. tostring(RAM_STATUS_PUSH_PORT) .. "/ClaimServer"
+    if tostring(RAM_STATUS_PUSH_PASSWORD or "") == "" then
+        return base
+    end
+
+    return base .. "?Password=" .. urlEncodeBasic(RAM_STATUS_PUSH_PASSWORD)
+end
+
+local function tryClaimServerViaRam(jobId)
+    if not RAM_SERVER_CLAIM_ENABLED then
+        return nil, "disabled"
+    end
+
+    local requestFn = request or http_request or httprequest or (syn and syn.request) or (http and http.request) or (fluxus and fluxus.request)
+    if type(requestFn) ~= "function" then
+        return nil, "no_request_function"
+    end
+
+    local leaseSeconds = math.max(10, tonumber(RAM_SERVER_CLAIM_LEASE_SECONDS) or tonumber(SHARED_SERVER_BLOCK_SECONDS) or JOINER_SERVER_BLOCK_SECONDS)
+    local payload = {
+        Account = tostring(LocalPlayer.Name or ""),
+        Username = tostring(LocalPlayer.Name or ""),
+        UserId = tostring(LocalPlayer.UserId or ""),
+        PlaceId = tostring(TargetPlaceId or game.PlaceId or 0),
+        JobId = tostring(jobId or ""),
+        LeaseSeconds = leaseSeconds,
+    }
+
+    local okEncode, body = pcall(HttpService.JSONEncode, HttpService, payload)
+    if not okEncode then
+        return nil, "encode_failed"
+    end
+
+    local endpoint = getRamServerClaimEndpoint()
+    local headers = { ["Content-Type"] = "application/json" }
+    local variants = {
+        { Url = endpoint, Method = "POST", Headers = headers, Body = body },
+        { url = endpoint, method = "POST", headers = headers, body = body },
+    }
+
+    local response = nil
+    local lastError = "request_failed"
+    for _, options in ipairs(variants) do
+        local okReq, res = pcall(requestFn, options)
+        if okReq and res ~= nil then
+            response = res
+            break
+        end
+        if not okReq then
+            lastError = tostring(res)
+        end
+    end
+
+    if not response then
+        return nil, lastError
+    end
+
+    local statusCode = tonumber(response.StatusCode or response.status or response.Status or response.code)
+    if statusCode and (statusCode < 200 or statusCode >= 300) then
+        return nil, "http_" .. tostring(statusCode)
+    end
+
+    local bodyRaw = response.Body or response.body
+    if type(bodyRaw) == "table" then
+        if bodyRaw.claimed == true then
+            return true, nil
+        end
+        if bodyRaw.claimed == false then
+            return false, tostring(bodyRaw.owner or "")
+        end
+    elseif type(bodyRaw) == "string" and bodyRaw ~= "" then
+        local okDecode, decoded = pcall(HttpService.JSONDecode, HttpService, bodyRaw)
+        if okDecode and type(decoded) == "table" then
+            if decoded.claimed == true then
+                return true, nil
+            end
+            if decoded.claimed == false then
+                return false, tostring(decoded.owner or "")
+            end
+        end
+        if bodyRaw == "true" then
+            return true, nil
+        end
+    end
+
+    return nil, "invalid_response"
+end
+
 local function setBlockOnMap(map, jobId, seconds, allowPermanent)
     if type(map) ~= "table" then
         return
@@ -1068,6 +1165,17 @@ local function tryClaimServerForHop(jobId)
     end
 
     if isServerBlocked(jobId) then
+        return false
+    end
+
+    local ramClaimed, ramReason = tryClaimServerViaRam(jobId)
+    if ramClaimed == true then
+        markServerBlocked(jobId, math.max(1, tonumber(SHARED_SERVER_BLOCK_SECONDS) or JOINER_SERVER_BLOCK_SECONDS))
+        return true
+    end
+    if ramClaimed == false then
+        markServerBlocked(jobId, math.max(1, tonumber(SHARED_SERVER_BLOCK_SECONDS) or JOINER_SERVER_BLOCK_SECONDS))
+        joinerDebugWarn("ram claim denied target=" .. jobId .. " owner=" .. tostring(ramReason or "unknown"))
         return false
     end
 

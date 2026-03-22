@@ -94,6 +94,7 @@ namespace RBX_Alt_Manager
         private System.Timers.Timer LiveStatusTimer;
         private System.Timers.Timer LastSeenTimer;
         private readonly static Regex BrowserTrackerRegex = new Regex(@"(?:\-b\s+|browsertrackerid[:=])(\d+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private readonly static Regex MultiRbxHandleRegex = new Regex(@"^\s*([0-9A-F]+):\s+\w+\s+.+\\(ROBLOX_singletonMutex|ROBLOX_singletonEvent)\b", RegexOptions.IgnoreCase | RegexOptions.Multiline | RegexOptions.Compiled);
         private int PresenceUpdateInProgress;
         private int LiveStatusUpdateInProgress;
         private DateTime LastOpenInstancePresenceUpdate = DateTime.MinValue;
@@ -104,10 +105,14 @@ namespace RBX_Alt_Manager
         private readonly ConcurrentDictionary<long, ScriptLiveStatusOverride> ScriptLiveStatusOverrides = new ConcurrentDictionary<long, ScriptLiveStatusOverride>();
         private static readonly TimeSpan ScriptLiveStatusOverrideTtl = TimeSpan.FromSeconds(15);
         private const long AutoRejoinPlaceId = 109983668079237;
-        private static readonly TimeSpan AutoRejoinOfflineThreshold = TimeSpan.FromSeconds(30);
+        private static readonly TimeSpan AutoRejoinOfflineThreshold = TimeSpan.FromSeconds(60);
         private static readonly TimeSpan AutoRejoinRetryCooldown = TimeSpan.FromSeconds(30);
         private readonly ConcurrentDictionary<long, AutoRejoinState> AutoRejoinStates = new ConcurrentDictionary<long, AutoRejoinState>();
         private readonly ConcurrentDictionary<long, byte> AutoRejoinInProgress = new ConcurrentDictionary<long, byte>();
+        private readonly ConcurrentDictionary<string, ServerClaimState> ScriptServerClaims = new ConcurrentDictionary<string, ServerClaimState>();
+        private readonly object ScriptServerClaimsLock = new object();
+        private static readonly TimeSpan ScriptServerClaimMinLease = TimeSpan.FromSeconds(10);
+        private static readonly TimeSpan ScriptServerClaimMaxLease = TimeSpan.FromMinutes(30);
 
         private sealed class ScriptLiveStatusOverride
         {
@@ -123,6 +128,12 @@ namespace RBX_Alt_Manager
             public bool HasSeenActiveSession { get; set; }
             public DateTime? OfflineSinceUtc { get; set; }
             public DateTime LastAttemptUtc { get; set; } = DateTime.MinValue;
+        }
+
+        private sealed class ServerClaimState
+        {
+            public string Owner { get; set; }
+            public DateTime ExpiresAtUtc { get; set; }
         }
 
         private static readonly byte[] Entropy = new byte[] { 0x52, 0x4f, 0x42, 0x4c, 0x4f, 0x58, 0x20, 0x41, 0x43, 0x43, 0x4f, 0x55, 0x4e, 0x54, 0x20, 0x4d, 0x41, 0x4e, 0x41, 0x47, 0x45, 0x52, 0x20, 0x7c, 0x20, 0x3a, 0x29, 0x20, 0x7c, 0x20, 0x42, 0x52, 0x4f, 0x55, 0x47, 0x48, 0x54, 0x20, 0x54, 0x4f, 0x20, 0x59, 0x4f, 0x55, 0x20, 0x42, 0x55, 0x59, 0x20, 0x69, 0x63, 0x33, 0x77, 0x30, 0x6c, 0x66 };
@@ -1152,6 +1163,9 @@ namespace RBX_Alt_Manager
 
                 await CloseAccountProcessForAutoRejoin(account);
 
+                if (General.Get<bool>("EnableMultiRbx"))
+                    UpdateMultiRoblox();
+
                 string Result = await account.JoinServer(AutoRejoinPlaceId, "", false, false, true);
                 if (!string.Equals(Result, "Success", StringComparison.OrdinalIgnoreCase))
                     Program.Logger.Warn($"[AutoRejoin] Relaunch failed for {account.Username}: {Result}");
@@ -1188,14 +1202,10 @@ namespace RBX_Alt_Manager
                 AutoRejoinState State = AutoRejoinStates.GetOrAdd(account.UserID, _ => new AutoRejoinState());
                 bool InGame = IsAccountInGame(account);
                 DateTime? LastSignalUtc = account.LastLiveStatusUpdateUtc != DateTime.MinValue ? account.LastLiveStatusUpdateUtc : (DateTime?)null;
+                bool SignalStale = LastSignalUtc.HasValue && (NowUtc - LastSignalUtc.Value) > AutoRejoinOfflineThreshold;
+                bool MissingSignalWhileOpen = account.HasOpenInstance && !LastSignalUtc.HasValue;
 
-                if (LastSignalUtc.HasValue && (NowUtc - LastSignalUtc.Value) > AutoRejoinOfflineThreshold)
-                    InGame = false;
-
-                if (account.HasOpenInstance || InGame)
-                    State.HasSeenActiveSession = true;
-
-                if (!State.HasSeenActiveSession && LastSignalUtc.HasValue)
+                if (account.HasOpenInstance || InGame || LastSignalUtc.HasValue)
                     State.HasSeenActiveSession = true;
 
                 if (!State.HasSeenActiveSession)
@@ -1204,13 +1214,17 @@ namespace RBX_Alt_Manager
                     continue;
                 }
 
-                if (InGame)
+                // In-game with a fresh signal should never be auto-rejoined.
+                if (InGame && !SignalStale)
                 {
                     State.OfflineSinceUtc = null;
                     continue;
                 }
 
-                State.OfflineSinceUtc ??= LastSignalUtc ?? NowUtc;
+                if (MissingSignalWhileOpen)
+                    State.OfflineSinceUtc ??= NowUtc;
+                else
+                    State.OfflineSinceUtc ??= LastSignalUtc ?? NowUtc;
 
                 if ((NowUtc - State.OfflineSinceUtc.Value) < AutoRejoinOfflineThreshold)
                     continue;
@@ -1222,6 +1236,8 @@ namespace RBX_Alt_Manager
                     continue;
 
                 State.LastAttemptUtc = NowUtc;
+
+                Program.Logger.Info($"[AutoRejoin] Watchdog trigger for {account.Username}: lastSignal={(LastSignalUtc.HasValue ? LastSignalUtc.Value.ToString("o") : "none")}, open={account.HasOpenInstance}, inGame={InGame}, stale={SignalStale}, missingWhileOpen={MissingSignalWhileOpen}");
                 _ = RelaunchForAutoRejoin(account);
             }
 
@@ -1232,6 +1248,73 @@ namespace RBX_Alt_Manager
 
                 AutoRejoinStates.TryRemove(UserId, out _);
                 AutoRejoinInProgress.TryRemove(UserId, out _);
+            }
+        }
+
+        private static string BuildScriptServerClaimKey(long PlaceId, string JobId)
+        {
+            string NormalizedJobId = (JobId ?? string.Empty).Trim().ToLowerInvariant();
+            if (PlaceId <= 0 || string.IsNullOrEmpty(NormalizedJobId))
+                return string.Empty;
+
+            return $"{PlaceId}:{NormalizedJobId}";
+        }
+
+        private static TimeSpan ClampScriptServerLease(int LeaseSeconds)
+        {
+            if (LeaseSeconds <= 0)
+                return ScriptServerClaimMinLease;
+
+            TimeSpan Lease = TimeSpan.FromSeconds(LeaseSeconds);
+            if (Lease < ScriptServerClaimMinLease)
+                return ScriptServerClaimMinLease;
+            if (Lease > ScriptServerClaimMaxLease)
+                return ScriptServerClaimMaxLease;
+            return Lease;
+        }
+
+        private bool TryClaimScriptServer(long PlaceId, string JobId, string Owner, int LeaseSeconds, out DateTime ExpiresAtUtc, out string ExistingOwner)
+        {
+            ExpiresAtUtc = DateTime.MinValue;
+            ExistingOwner = string.Empty;
+
+            string Key = BuildScriptServerClaimKey(PlaceId, JobId);
+            if (string.IsNullOrEmpty(Key))
+                return false;
+
+            string NormalizedOwner = string.IsNullOrWhiteSpace(Owner) ? "unknown" : Owner.Trim();
+            DateTime NowUtc = DateTime.UtcNow;
+            DateTime NewExpiryUtc = NowUtc.Add(ClampScriptServerLease(LeaseSeconds));
+
+            lock (ScriptServerClaimsLock)
+            {
+                foreach (KeyValuePair<string, ServerClaimState> Pair in ScriptServerClaims.ToArray())
+                {
+                    if (Pair.Value == null || Pair.Value.ExpiresAtUtc <= NowUtc)
+                        ScriptServerClaims.TryRemove(Pair.Key, out _);
+                }
+
+                if (ScriptServerClaims.TryGetValue(Key, out ServerClaimState Existing)
+                    && Existing != null
+                    && Existing.ExpiresAtUtc > NowUtc)
+                {
+                    if (!string.Equals(Existing.Owner, NormalizedOwner, StringComparison.OrdinalIgnoreCase))
+                    {
+                        ExpiresAtUtc = Existing.ExpiresAtUtc;
+                        ExistingOwner = Existing.Owner;
+                        return false;
+                    }
+                }
+
+                ScriptServerClaims[Key] = new ServerClaimState
+                {
+                    Owner = NormalizedOwner,
+                    ExpiresAtUtc = NewExpiryUtc
+                };
+
+                ExpiresAtUtc = NewExpiryUtc;
+                ExistingOwner = NormalizedOwner;
+                return true;
             }
         }
 
@@ -1263,7 +1346,7 @@ namespace RBX_Alt_Manager
 
             if ((Method == "GetCookie" || Method == "GetAccounts" || Method == "LaunchAccount" || Method == "FollowUser") && ((WSPassword != null && WSPassword.Length < 6) || (Password != null && Password != WSPassword))) return Reply("Invalid Password, make sure your password contains 6 or more characters", false, 401, "Invalid Password");
 
-            if (!Developer.Get<bool>("EnableWebServer") && Method != "PushLiveStatus")
+            if (!Developer.Get<bool>("EnableWebServer") && Method != "PushLiveStatus" && Method != "ClaimServer")
                 return Reply("Method not allowed", false, 401, "Method not allowed");
 
             if (Method == "GetAccounts")
@@ -1398,6 +1481,58 @@ namespace RBX_Alt_Manager
                     AccountsView.InvokeIfRequired(() => AccountsView.RefreshObject(TargetAccountObj));
 
                 return Reply("true", true, Raw: "true");
+            }
+
+            if (Method == "ClaimServer")
+            {
+                JObject Payload = null;
+                if (!string.IsNullOrWhiteSpace(Body))
+                    Body.TryParseJson(out Payload);
+
+                string PlaceIdValue = request.QueryString["PlaceId"]
+                    ?? request.QueryString["placeid"]
+                    ?? Payload?["PlaceId"]?.ToString()
+                    ?? Payload?["placeId"]?.ToString();
+
+                string JobId = request.QueryString["JobId"]
+                    ?? request.QueryString["jobid"]
+                    ?? Payload?["JobId"]?.ToString()
+                    ?? Payload?["jobId"]?.ToString();
+
+                string Owner = request.QueryString["Owner"]
+                    ?? request.QueryString["Account"]
+                    ?? request.QueryString["Username"]
+                    ?? request.QueryString["UserId"]
+                    ?? Payload?["Owner"]?.ToString()
+                    ?? Payload?["Account"]?.ToString()
+                    ?? Payload?["Username"]?.ToString()
+                    ?? Payload?["UserId"]?.ToString()
+                    ?? Payload?["userid"]?.ToString();
+
+                string LeaseSecondsValue = request.QueryString["LeaseSeconds"]
+                    ?? request.QueryString["leaseSeconds"]
+                    ?? Payload?["LeaseSeconds"]?.ToString()
+                    ?? Payload?["leaseSeconds"]?.ToString();
+
+                if (!long.TryParse(PlaceIdValue, out long PlaceId) || PlaceId <= 0 || string.IsNullOrWhiteSpace(JobId))
+                    return Reply(JsonConvert.SerializeObject(new { ok = false, claimed = false, error = "invalid_place_or_job" }), true);
+
+                int LeaseSeconds = 120;
+                if (int.TryParse(LeaseSecondsValue, out int ParsedLease) && ParsedLease > 0)
+                    LeaseSeconds = ParsedLease;
+
+                bool Claimed = TryClaimScriptServer(PlaceId, JobId, Owner, LeaseSeconds, out DateTime ExpiresAtUtc, out string ExistingOwner);
+                string Response = JsonConvert.SerializeObject(new
+                {
+                    ok = true,
+                    claimed = Claimed,
+                    placeId = PlaceId,
+                    jobId = JobId,
+                    owner = ExistingOwner,
+                    expiresAtUtc = ExpiresAtUtc == DateTime.MinValue ? string.Empty : ExpiresAtUtc.ToString("o"),
+                });
+
+                return Reply(Response, true);
             }
 
             if (string.IsNullOrEmpty(Account)) return Reply("Empty Account", false);
@@ -1568,7 +1703,7 @@ namespace RBX_Alt_Manager
         private void AccountManager_Shown(object sender, EventArgs e)
         {
             if (!UpdateMultiRoblox() && !General.Get<bool>("HideRbxAlert"))
-                MessageBox.Show("WARNING: Roblox is currently running, multi roblox will not work until you restart the account manager with roblox closed.", "Roblox Account Manager", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("WARNING: Multi Roblox could not lock Roblox's singleton right now.\nRAM will retry automatically for bulk launch.\nIf it still fails, run RAM as admin once and retry.", "Roblox Account Manager", MessageBoxButtons.OK, MessageBoxIcon.Warning);
 
             if (General.Get<bool>("CheckForUpdates"))
             {
@@ -1698,22 +1833,202 @@ namespace RBX_Alt_Manager
         {
             bool Enabled = General.Get<bool>("EnableMultiRbx");
 
-            if (Enabled && rbxMultiMutex == null)
-                try
-                {
-                    rbxMultiMutex = new Mutex(true, "ROBLOX_singletonMutex");
-
-                    if (!rbxMultiMutex.WaitOne(TimeSpan.Zero, true))
-                        return false;
-                }
-                catch { return false; }
-            else if (!Enabled && rbxMultiMutex != null)
+            if (Enabled)
             {
-                rbxMultiMutex.Close();
+                if (rbxMultiMutex != null)
+                    return true;
+
+                if (TryAcquireMultiRobloxMutex())
+                    return true;
+
+                if (TryReleaseRobloxSingletonHandles())
+                {
+                    Thread.Sleep(175);
+
+                    if (TryAcquireMultiRobloxMutex())
+                        return true;
+                }
+
+                return false;
+            }
+
+            if (!Enabled && rbxMultiMutex != null)
+            {
+                try { rbxMultiMutex.ReleaseMutex(); } catch { }
+                try { rbxMultiMutex.Close(); } catch { }
+                try { rbxMultiMutex.Dispose(); } catch { }
                 rbxMultiMutex = null;
             }
 
             return true;
+        }
+
+        private bool TryAcquireMultiRobloxMutex()
+        {
+            if (rbxMultiMutex != null)
+                return true;
+
+            try
+            {
+                rbxMultiMutex = new Mutex(true, "ROBLOX_singletonMutex");
+
+                try
+                {
+                    if (!rbxMultiMutex.WaitOne(TimeSpan.Zero, true))
+                    {
+                        rbxMultiMutex.Dispose();
+                        rbxMultiMutex = null;
+                        return false;
+                    }
+                }
+                catch (AbandonedMutexException)
+                {
+                    // Another process abandoned this mutex; ownership has been transferred.
+                }
+
+                return true;
+            }
+            catch (Exception x)
+            {
+                Program.Logger.Warn($"[MultiRbx] Failed acquiring ROBLOX_singletonMutex: {x.Message}");
+
+                try { rbxMultiMutex?.Dispose(); } catch { }
+                rbxMultiMutex = null;
+                return false;
+            }
+        }
+
+        private static string ReadProcessOutput(Process process)
+        {
+            string StdOut = string.Empty;
+            string StdErr = string.Empty;
+
+            try { StdOut = process?.StandardOutput?.ReadToEnd() ?? string.Empty; } catch { }
+            try { StdErr = process?.StandardError?.ReadToEnd() ?? string.Empty; } catch { }
+
+            if (string.IsNullOrEmpty(StdErr))
+                return StdOut ?? string.Empty;
+
+            return $"{StdOut}{Environment.NewLine}{StdErr}";
+        }
+
+        private bool EnsureHandleToolReady()
+        {
+            try
+            {
+                if (!File.Exists(RobloxWatcher.HandlePath))
+                    File.WriteAllBytes(RobloxWatcher.HandlePath, Resources.handle);
+            }
+            catch (Exception x)
+            {
+                Program.Logger.Warn($"[MultiRbx] Failed writing handle tool: {x.Message}");
+                return false;
+            }
+
+            if (RobloxWatcher.IsHandleEulaAccepted())
+                return true;
+
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(@"SOFTWARE\Sysinternals\Handle"))
+                    key?.SetValue("EulaAccepted", 1, RegistryValueKind.DWord);
+            }
+            catch (Exception x)
+            {
+                Program.Logger.Warn($"[MultiRbx] Failed setting Handle EULA value: {x.Message}");
+            }
+
+            return RobloxWatcher.IsHandleEulaAccepted();
+        }
+
+        private bool TryReleaseRobloxSingletonHandles()
+        {
+            if (!EnsureHandleToolReady())
+                return false;
+
+            bool ClosedAny = false;
+            Process[] RobloxProcesses = Process.GetProcessesByName("RobloxPlayerBeta");
+
+            foreach (Process process in RobloxProcesses)
+            {
+                int pid = -1;
+
+                try
+                {
+                    pid = process.Id;
+                    if (process.HasExited) continue;
+
+                    ProcessStartInfo scan = new ProcessStartInfo(RobloxWatcher.HandlePath)
+                    {
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        Arguments = $"-a -nobanner -p {pid} ROBLOX_singleton"
+                    };
+
+                    using (Process scanProc = Process.Start(scan))
+                    {
+                        if (scanProc == null) continue;
+
+                        if (!scanProc.WaitForExit(6000))
+                        {
+                            try { scanProc.Kill(); } catch { }
+                            continue;
+                        }
+
+                        string scanOutput = ReadProcessOutput(scanProc);
+                        MatchCollection matches = MultiRbxHandleRegex.Matches(scanOutput ?? string.Empty);
+
+                        foreach (Match match in matches)
+                        {
+                            if (!match.Success || match.Groups.Count < 2) continue;
+
+                            string handleId = match.Groups[1].Value;
+                            if (string.IsNullOrWhiteSpace(handleId)) continue;
+
+                            ProcessStartInfo close = new ProcessStartInfo(RobloxWatcher.HandlePath)
+                            {
+                                UseShellExecute = false,
+                                CreateNoWindow = true,
+                                RedirectStandardOutput = true,
+                                RedirectStandardError = true,
+                                Arguments = $"-c {handleId} -p {pid} -y -nobanner"
+                            };
+
+                            using (Process closeProc = Process.Start(close))
+                            {
+                                if (closeProc == null) continue;
+
+                                if (!closeProc.WaitForExit(6000))
+                                {
+                                    try { closeProc.Kill(); } catch { }
+                                    continue;
+                                }
+
+                                string closeOutput = ReadProcessOutput(closeProc);
+                                bool closed = closeProc.ExitCode == 0 && closeOutput.IndexOf("Error", StringComparison.OrdinalIgnoreCase) < 0;
+
+                                if (closed)
+                                {
+                                    ClosedAny = true;
+                                    Program.Logger.Info($"[MultiRbx] Closed singleton handle {handleId} for PID {pid}");
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (Exception x)
+                {
+                    Program.Logger.Warn($"[MultiRbx] Failed singleton handle cleanup for PID {pid}: {x.Message}");
+                }
+                finally
+                {
+                    try { process.Dispose(); } catch { }
+                }
+            }
+
+            return ClosedAny;
         }
 
         private bool EnsureMultiRobloxForBulkLaunch()
@@ -1724,10 +2039,13 @@ namespace RBX_Alt_Manager
                 IniSettings.Save("RAMSettings.ini");
             }
 
+            if (Process.GetProcessesByName("RobloxPlayerBeta").Length > 0)
+                TryReleaseRobloxSingletonHandles();
+
             if (UpdateMultiRoblox())
                 return true;
 
-            MessageBox.Show("Failed to enable Multi Roblox for bulk launching.\nClose all Roblox instances and try again.", "Roblox Account Manager", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            MessageBox.Show("Failed to enable Multi Roblox for bulk launching.\nTry toggling Multi Roblox in settings, then launch again.\nIf it still fails, run RAM as admin once and retry.", "Roblox Account Manager", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return false;
         }
 
@@ -2204,9 +2522,15 @@ namespace RBX_Alt_Manager
 
         private async void PlaceTimer_Tick(object sender, EventArgs e)
         {
-            if (EconClient == null) return;
-
             PlaceTimer.Stop();
+
+            if (PlaceID != null)
+            {
+                General.Set("SavedPlaceId", PlaceID.Text);
+                IniSettings.Save("RAMSettings.ini");
+            }
+
+            if (EconClient == null) return;
 
             RestRequest request = new RestRequest($"v2/assets/{PlaceID.Text}/details", Method.Get);
             request.AddHeader("Accept", "application/json");
