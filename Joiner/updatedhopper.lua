@@ -1466,12 +1466,28 @@ local function pushLiveStatusToRam(force, inGameOverride)
         return false, "cooldown"
     end
 
+    local detectedPlaceId = tonumber(game.PlaceId)
+    local detectedJobId = tostring(game.JobId or "")
+    local detectedInGame = (detectedPlaceId or 0) > 0 and detectedJobId ~= ""
+
     local inGame = inGameOverride
     if type(inGame) ~= "boolean" then
-        inGame = true
+        inGame = detectedInGame
     end
 
-    local placeId = tonumber(game.PlaceId) or tonumber(TargetPlaceId)
+    local placeId = detectedPlaceId or tonumber(TargetPlaceId)
+    if inGame and (not placeId or placeId <= 0) then
+        inGame = false
+    end
+
+    local gameName = ""
+    if inGame then
+        gameName = tostring(getCurrentPlaceName() or "")
+        if gameName == "" and placeId and placeId > 0 then
+            gameName = tostring(placeId)
+        end
+    end
+
     local payload = {
         Account = tostring(LocalPlayer.Name or ""),
         Username = tostring(LocalPlayer.Name or ""),
@@ -1480,7 +1496,7 @@ local function pushLiveStatusToRam(force, inGameOverride)
         IsOnServer = inGame,
         InGame = inGame,
         PlaceId = inGame and tostring(placeId or "") or "",
-        GameName = inGame and tostring(getCurrentPlaceName() or "") or "",
+        GameName = gameName,
         JobId = inGame and tostring(game.JobId or "") or "",
     }
 
@@ -2263,10 +2279,10 @@ task.spawn(function()
         return
     end
 
-    pushLiveStatusToRam(true, true)
+    pushLiveStatusToRam(true)
 
     while task.wait(math.max(0.25, tonumber(RAM_STATUS_PUSH_INTERVAL) or 1)) do
-        pushLiveStatusToRam(false, true)
+        pushLiveStatusToRam(false)
     end
 end)
 

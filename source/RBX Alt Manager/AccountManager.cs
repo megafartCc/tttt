@@ -989,18 +989,22 @@ namespace RBX_Alt_Manager
             GameChanged = false;
             if (account == null || Override == null) return false;
 
-            bool StateChanged = account.HasOpenInstance != Override.HasOpenInstance || account.IsOnServer != Override.IsOnServer;
+            bool OverrideIsOnServer = Override.IsOnServer;
+            if (OverrideIsOnServer && !Override.PlaceId.HasValue && string.IsNullOrWhiteSpace(Override.GameName))
+                OverrideIsOnServer = false;
+
+            bool StateChanged = account.HasOpenInstance != Override.HasOpenInstance || account.IsOnServer != OverrideIsOnServer;
 
             if (StateChanged)
             {
                 account.HasOpenInstance = Override.HasOpenInstance;
-                account.IsOnServer = Override.IsOnServer;
+                account.IsOnServer = OverrideIsOnServer;
             }
 
-            long? PlaceId = Override.IsOnServer ? Override.PlaceId : null;
+            long? PlaceId = OverrideIsOnServer ? Override.PlaceId : null;
             string GameName = string.Empty;
 
-            if (Override.IsOnServer)
+            if (OverrideIsOnServer)
             {
                 if (!string.IsNullOrWhiteSpace(Override.GameName))
                     GameName = Override.GameName;
@@ -1030,7 +1034,15 @@ namespace RBX_Alt_Manager
 
         private static bool IsAccountInGame(Account account)
         {
-            return account != null && (account.IsOnServer || account.Presence?.userPresenceType == UserPresenceType.InGame);
+            if (account == null) return false;
+
+            bool HasResolvedGame = account.CurrentPlaceId.HasValue
+                || (!string.IsNullOrWhiteSpace(account.CurrentGameName) && !string.Equals(account.CurrentGameName, "Loading...", StringComparison.OrdinalIgnoreCase));
+
+            bool ScriptInGame = account.IsOnServer && HasResolvedGame;
+            bool PresenceInGame = account.Presence?.userPresenceType == UserPresenceType.InGame && GetPresencePlaceId(account).HasValue;
+
+            return ScriptInGame || PresenceInGame;
         }
 
         private async Task CloseAccountProcessForAutoRejoin(Account account)
@@ -2678,7 +2690,8 @@ namespace RBX_Alt_Manager
             foreach (Account account in Accounts)
             {
                 long? PlaceId = GetPresencePlaceId(account);
-                bool InGame = account.IsOnServer || account.Presence?.userPresenceType == UserPresenceType.InGame;
+                bool PresenceInGame = account.Presence?.userPresenceType == UserPresenceType.InGame && PlaceId.HasValue;
+                bool InGame = account.IsOnServer || PresenceInGame;
                 string GameName = string.Empty;
 
                 if (InGame)
@@ -2753,7 +2766,8 @@ namespace RBX_Alt_Manager
                         IsOnServer = ServerState.Value;
                     else
                     {
-                        IsOnServer = account.Presence?.userPresenceType == UserPresenceType.InGame;
+                        long? PresencePlaceId = GetPresencePlaceId(account);
+                        IsOnServer = account.Presence?.userPresenceType == UserPresenceType.InGame && PresencePlaceId.HasValue;
                         PresenceFallback.Add(account);
                     }
                 }
@@ -2795,7 +2809,7 @@ namespace RBX_Alt_Manager
 
             foreach (Account account in PresenceRefreshTargets)
             {
-                bool IsOnServer = account.Presence?.userPresenceType == UserPresenceType.InGame;
+                bool IsOnServer = account.Presence?.userPresenceType == UserPresenceType.InGame && GetPresencePlaceId(account).HasValue;
 
                 if (account.HasOpenInstance && account.IsOnServer != IsOnServer)
                 {
