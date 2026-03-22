@@ -84,6 +84,8 @@ namespace RBX_Alt_Manager
         private static Mutex rbxMultiMutex;
         private readonly static object saveLock = new object();
         private readonly static object rgSaveLock = new object();
+        private readonly static object browserTrackerLock = new object();
+        private readonly static Random browserTrackerRandom = new Random();
         public event EventHandler<GameArgs> RecentGameAdded;
 
         private bool IsResettingPassword;
@@ -2132,6 +2134,93 @@ namespace RBX_Alt_Manager
             RefreshView();
         }
 
+        private static string GenerateUniqueBrowserTrackerId(HashSet<string> used)
+        {
+            while (true)
+            {
+                string id;
+                lock (browserTrackerLock)
+                    id = browserTrackerRandom.Next(100000, 175000).ToString() + browserTrackerRandom.Next(100000, 900000).ToString();
+
+                if (!string.IsNullOrEmpty(id) && used.Add(id))
+                    return id;
+            }
+        }
+
+        private void EnsureUniqueBrowserTrackerIds(IEnumerable<Account> targets)
+        {
+            if (targets == null) return;
+
+            HashSet<Account> targetSet = new HashSet<Account>(targets.Where(x => x != null));
+            if (targetSet.Count == 0) return;
+
+            HashSet<string> used = new HashSet<string>(StringComparer.Ordinal);
+
+            foreach (Account account in AccountsList)
+            {
+                if (account == null || targetSet.Contains(account)) continue;
+
+                string tracker = account.BrowserTrackerID?.Trim();
+                if (!string.IsNullOrEmpty(tracker))
+                    used.Add(tracker);
+            }
+
+            bool changed = false;
+
+            foreach (Account account in targetSet)
+            {
+                string tracker = account.BrowserTrackerID?.Trim() ?? string.Empty;
+
+                if (string.IsNullOrEmpty(tracker) || used.Contains(tracker))
+                {
+                    account.BrowserTrackerID = GenerateUniqueBrowserTrackerId(used);
+                    changed = true;
+                    continue;
+                }
+
+                account.BrowserTrackerID = tracker;
+                used.Add(tracker);
+            }
+
+            if (changed)
+                SaveAccounts();
+        }
+
+        private void KillAllInstances_Click(object sender, EventArgs e)
+        {
+            int closed = 0;
+
+            foreach (Process process in Process.GetProcessesByName("RobloxPlayerBeta"))
+            {
+                try
+                {
+                    process.CloseMainWindow();
+                    Thread.Sleep(120);
+
+                    if (!process.HasExited)
+                        process.Kill();
+
+                    closed++;
+                }
+                catch { }
+                finally
+                {
+                    try { process.Dispose(); } catch { }
+                }
+            }
+
+            foreach (Account account in AccountsList)
+            {
+                account.HasOpenInstance = false;
+                account.IsOnServer = false;
+                account.CurrentPlaceId = null;
+                account.CurrentGameName = string.Empty;
+            }
+
+            AccountsView.InvokeIfRequired(() => AccountsView.RefreshObjects(AccountsList));
+            MessageBox.Show($"Closed {closed} Roblox instance(s).", "Roblox Account Manager", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
         private void JoinServer_Click(object sender, EventArgs e)
         {
             Match IDMatch = Regex.Match(PlaceID.Text, @"\/games\/(\d+)[\/|\?]?"); // idiotproofing
@@ -2159,6 +2248,8 @@ namespace RBX_Alt_Manager
             bool LaunchMultiple = LaunchTargets.Count > 1;
             Account SingleTarget = LaunchTargets.Count == 1 ? LaunchTargets[0] : SelectedAccount;
             string JoinJobId = VIPServer ? JobID.Text.Substring(4) : JobID.Text;
+
+            EnsureUniqueBrowserTrackerIds(LaunchTargets);
 
             if (LaunchMultiple && !EnsureMultiRobloxForBulkLaunch())
                 return;
@@ -2197,6 +2288,8 @@ namespace RBX_Alt_Manager
             List<Account> LaunchTargets = AccountsView.SelectedObjects.Cast<Account>().Where(account => account != null).Distinct().ToList();
             bool LaunchMultiple = LaunchTargets.Count > 1;
             Account SingleTarget = LaunchTargets.Count == 1 ? LaunchTargets[0] : SelectedAccount;
+
+            EnsureUniqueBrowserTrackerIds(LaunchTargets);
 
             if (LaunchMultiple && !EnsureMultiRobloxForBulkLaunch())
                 return;
@@ -2696,41 +2789,62 @@ namespace RBX_Alt_Manager
 
         private async Task LaunchAccounts(List<Account> Accounts, long PlaceID, string JobID, bool FollowUser = false, bool VIPServer = false)
         {
+            EnsureUniqueBrowserTrackerIds(Accounts);
+
             int Delay = General.Exists("AccountJoinDelay") ? General.Get<int>("AccountJoinDelay") : 8;
 
             bool AsyncJoin = General.Get<bool>("AsyncJoin");
             CancellationTokenSource Token = LauncherToken;
             List<string> Failures = new List<string>();
+            bool RestoreAutoCloseLastProcess = false;
 
-            foreach (Account account in Accounts)
+            if (Accounts != null && Accounts.Count > 1 && General.Get<bool>("AutoCloseLastProcess"))
             {
-                if (Token.IsCancellationRequested) break;
+                General.Set("AutoCloseLastProcess", "false");
+                RestoreAutoCloseLastProcess = true;
+                IniSettings.Save("RAMSettings.ini");
+            }
 
-                long PlaceId = PlaceID;
-                string JobId = JobID;
-
-                if (!FollowUser)
+            try
+            {
+                foreach (Account account in Accounts)
                 {
-                    if (!string.IsNullOrEmpty(account.GetField("SavedPlaceId")) && long.TryParse(account.GetField("SavedPlaceId"), out long PID)) PlaceId = PID;
-                    if (!string.IsNullOrEmpty(account.GetField("SavedJobId"))) JobId = account.GetField("SavedJobId");
-                }
+                    if (Token.IsCancellationRequested) break;
 
-                string Result = await account.JoinServer(PlaceId, JobId, FollowUser, VIPServer);
-                if (!Result.Contains("Success"))
+                    long PlaceId = PlaceID;
+                    string JobId = JobID;
+
+                    if (!FollowUser)
+                    {
+                        if (!string.IsNullOrEmpty(account.GetField("SavedPlaceId")) && long.TryParse(account.GetField("SavedPlaceId"), out long PID)) PlaceId = PID;
+                        if (!string.IsNullOrEmpty(account.GetField("SavedJobId"))) JobId = account.GetField("SavedJobId");
+                    }
+
+                    string Result = await account.JoinServer(PlaceId, JobId, FollowUser, VIPServer);
+                    if (!Result.Contains("Success"))
+                    {
+                        Program.Logger.Warn($"[BulkLaunch] Failed launching {account.Username}: {Result}");
+                        Failures.Add($"{account.Username}: {Result.Split('\n').FirstOrDefault() ?? Result}");
+                    }
+
+                    if (AsyncJoin)
+                    {
+                        while (!LaunchNext)
+                            await Task.Delay(50);
+                    }
+                    else
+                        await Task.Delay(Delay * 1000);
+
+                    LaunchNext = false;
+                }
+            }
+            finally
+            {
+                if (RestoreAutoCloseLastProcess)
                 {
-                    Program.Logger.Warn($"[BulkLaunch] Failed launching {account.Username}: {Result}");
-                    Failures.Add($"{account.Username}: {Result.Split('\n').FirstOrDefault() ?? Result}");
+                    General.Set("AutoCloseLastProcess", "true");
+                    IniSettings.Save("RAMSettings.ini");
                 }
-
-                if (AsyncJoin)
-                {
-                    while (!LaunchNext)
-                        await Task.Delay(50);
-                }
-                else
-                    await Task.Delay(Delay * 1000);
-
-                LaunchNext = false;
             }
 
             LaunchNext = false;
