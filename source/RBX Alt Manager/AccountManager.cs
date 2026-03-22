@@ -1194,6 +1194,9 @@ namespace RBX_Alt_Manager
                 if (account.HasOpenInstance || InGame)
                     State.HasSeenActiveSession = true;
 
+                if (!State.HasSeenActiveSession && LastSignalUtc.HasValue)
+                    State.HasSeenActiveSession = true;
+
                 if (!State.HasSeenActiveSession)
                 {
                     State.OfflineSinceUtc = null;

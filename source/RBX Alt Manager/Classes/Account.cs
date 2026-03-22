@@ -645,6 +645,8 @@ namespace RBX_Alt_Manager
                     if (!Internal)
                         AccountManager.Instance.NextAccount();
 
+                    LastAppLaunch = DateTime.UtcNow;
+
                     await Task.Run(() =>
                     {
                         ProcessStartInfo Roblox = new ProcessStartInfo(RPath);
@@ -667,6 +669,8 @@ namespace RBX_Alt_Manager
                     {
                         try
                         {
+                            LastAppLaunch = DateTime.UtcNow;
+
                             ProcessStartInfo LaunchInfo = new ProcessStartInfo();
 
                             if (JoinVIP)
