@@ -34,6 +34,8 @@ local SaveTeleportAttempts = false
 local TargetPlaceId = 109983668079237
 
 local JOINER_URL = "https://j-production-875d.up.railway.app"
+local JOINER_SCRIPT = "public"
+local JOINER_KEY = "K9s2Wm4Qp7Xr1Vz8Nd3Lf6Tc0Hb5YuEa"
 local JOINER_REPORT_INTERVAL = 10
 local JOINER_SERVER_BLOCK_SECONDS = 300
 local JOINER_PERMANENT_BLOCK_SENTINEL = -1
@@ -1508,8 +1510,19 @@ local function sendJoinerRequest(method, path, payload)
     if base == "" then
         return nil, "missing_joiner_url"
     end
-    return sendJsonRequest(method, base .. tostring(path), payload, {
+
+    local requestPath = tostring(path or "")
+    local querySep = requestPath:find("?", 1, true) and "&" or "?"
+    local scriptName = tostring(JOINER_SCRIPT or "public")
+    if scriptName == "" then
+        scriptName = "public"
+    end
+    local keyText = tostring(JOINER_KEY or "")
+    requestPath = requestPath .. querySep .. "script=" .. scriptName .. "&k=" .. keyText
+
+    return sendJsonRequest(method, base .. requestPath, payload, {
         ["Content-Type"] = "application/json",
+        ["x-joiner-key"] = keyText,
     })
 end
 
