@@ -1,0 +1,12 @@
+# Runtime/user data
+AccountData.json
+AccountData.json.backup
+RecentGames.json
+RAMSettings.ini
+RAMTheme.ini
+log.txt
+
+# Build artifacts
+*.user
+*.suo
+*.pdb
