@@ -152,7 +152,6 @@ namespace RBX_Alt_Manager
             Prompts = IniSettings.Section("Prompts");
 
             if (!General.Exists("CheckForUpdates")) General.Set("CheckForUpdates", "false");
-            else if (General.Get<bool>("CheckForUpdates")) General.Set("CheckForUpdates", "false");
             if (!General.Exists("AccountJoinDelay")) General.Set("AccountJoinDelay", "8");
             if (!General.Exists("AsyncJoin")) General.Set("AsyncJoin", "false");
             if (!General.Exists("DisableAgingAlert")) General.Set("DisableAgingAlert", "false");
@@ -1488,6 +1487,30 @@ namespace RBX_Alt_Manager
         {
             if (!UpdateMultiRoblox() && !General.Get<bool>("HideRbxAlert"))
                 MessageBox.Show("WARNING: Roblox is currently running, multi roblox will not work until you restart the account manager with roblox closed.", "Roblox Account Manager", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+
+            if (General.Get<bool>("CheckForUpdates"))
+            {
+                _ = Task.Run(async () =>
+                {
+                    string LatestReleaseTag = await Auto_Update.AutoUpdater.TryGetLatestReleaseTagAsync();
+                    if (string.IsNullOrWhiteSpace(LatestReleaseTag))
+                        return;
+
+                    string LocalReleaseTag = Auto_Update.AutoUpdater.GetLocalReleaseTag();
+                    if (!string.IsNullOrWhiteSpace(LocalReleaseTag)
+                        && string.Equals(LocalReleaseTag, LatestReleaseTag, StringComparison.OrdinalIgnoreCase))
+                        return;
+
+                    InvokeIfRequired(() =>
+                    {
+                        if (!Utilities.YesNoPrompt("Roblox Account Manager", $"Custom update available ({LatestReleaseTag})", "Would you like to install it now?", false))
+                            return;
+
+                        using (Auto_Update.AutoUpdater Updater = new Auto_Update.AutoUpdater())
+                            Updater.ShowDialog(this);
+                    });
+                });
+            }
 
             int Major = Environment.OSVersion.Version.Major, Minor = Environment.OSVersion.Version.Minor;
 

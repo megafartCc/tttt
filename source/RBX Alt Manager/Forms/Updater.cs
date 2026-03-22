@@ -1,11 +1,12 @@
-﻿using IWshRuntimeLibrary;
+using Newtonsoft.Json.Linq;
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
+using System.Linq;
 using System.Net.Http;
-using System.Runtime.InteropServices;
-using System.Text.RegularExpressions;
+using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using File = System.IO.File;
@@ -14,419 +15,318 @@ namespace Auto_Update
 {
     public partial class AutoUpdater : Form
     {
+        private const string LatestReleaseApi = "https://api.github.com/repos/megafartCc/tttt/releases/latest";
+        private const string MainExecutableName = "Roblox Account Manager.exe";
+        private const string ReleaseTagFileName = "RAMReleaseTag.txt";
+
+        private static readonly string[] PreferredAssetTokens = { "ramv2", "custom", "release" };
+        private static readonly HashSet<string> PreservedFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "AccountData.json",
+            "AccountData.json.backup",
+            "RAMSettings.ini",
+            "RAMTheme.ini",
+            "RecentGames.json",
+            "log.txt"
+        };
+
+        private string DownloadArchivePath;
+        private string WorkingRootPath;
+        private long TotalDownloadSize;
+
+        private delegate void SafeCallDelegateSetProgress(int progress);
+        private delegate void SafeCallDelegateSetStatus(string text);
+
+        private sealed class ReleaseAsset
+        {
+            public string TagName { get; set; }
+            public string Name { get; set; }
+            public string Url { get; set; }
+        }
+
+        public static string GetLocalReleaseTag()
+        {
+            try
+            {
+                string PathValue = Path.Combine(Environment.CurrentDirectory, ReleaseTagFileName);
+                return File.Exists(PathValue) ? File.ReadAllText(PathValue).Trim() : string.Empty;
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        }
+
+        public static async Task<string> TryGetLatestReleaseTagAsync()
+        {
+            try
+            {
+                using HttpClient Client = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+                Client.DefaultRequestHeaders.Add("User-Agent", "RAMV2-Custom-Updater");
+
+                string ReleasesJson = await Client.GetStringAsync(LatestReleaseApi);
+                JObject Release = JObject.Parse(ReleasesJson);
+                return Release["tag_name"]?.Value<string>() ?? string.Empty;
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        }
+
         public AutoUpdater()
         {
             InitializeComponent();
         }
 
-        private string FileName = "Update.zip";
-        private readonly string UpdatePath = Path.Combine(Environment.CurrentDirectory, "Update");
-        private long TotalDownloadSize = 0;
-        private delegate void SafeCallDelegateSetProgress(int Progress);
-        private delegate void SafeCallDelegateSetStatus(string Text);
-
         private async void AutoUpdater_Load(object sender, EventArgs e)
         {
-            DirectoryInfo UpdateDir = new DirectoryInfo(UpdatePath);
+            try
+            {
+                await RunUpdateAsync();
+            }
+            catch (Exception x)
+            {
+                SetStatus("Error");
+                DialogResult result = MessageBox.Show(
+                    this,
+                    $"Update failed.\n\n{x.Message}\n\nMake sure the latest GitHub release has a .zip asset with app files.",
+                    "Custom Updater",
+                    MessageBoxButtons.RetryCancel,
+                    MessageBoxIcon.Error);
 
-            if (UpdateDir.Exists) UpdateDir.RecursiveDelete();
+                if (result == DialogResult.Retry)
+                    await RunUpdateAsync();
+                else
+                    Close();
+            }
+        }
 
-            FileName = Path.Combine(Directory.GetCurrentDirectory(), FileName);
+        private async Task RunUpdateAsync()
+        {
+            PrepareWorkingPaths();
 
-            await Download();
+            using HttpClient Client = new HttpClient { Timeout = TimeSpan.FromMinutes(30) };
+            Client.DefaultRequestHeaders.Add("User-Agent", "RAMV2-Custom-Updater");
+
+            SetStatus("Checking latest custom release...");
+            ReleaseAsset Asset = await FetchLatestReleaseAsset(Client);
+
+            string LocalReleaseTag = GetLocalReleaseTag();
+            if (!string.IsNullOrWhiteSpace(LocalReleaseTag)
+                && string.Equals(LocalReleaseTag, Asset.TagName, StringComparison.OrdinalIgnoreCase))
+            {
+                SetStatus($"Already up to date ({Asset.TagName})");
+                SetProgress(100);
+                await Task.Delay(1250);
+                Close();
+                return;
+            }
+
+            SetStatus($"Downloading {Asset.Name}...");
+            TotalDownloadSize = await TryGetContentLengthAsync(Client, Asset.Url) ?? 0;
+
+            using (FileStream File = new FileStream(DownloadArchivePath, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                Progress<float> Progress = new Progress<float>(OnProgressChanged);
+                await Client.DownloadAsync(Asset.Url, File, Progress);
+            }
+
+            SetStatus("Extracting files...");
+            string ExtractPath = Path.Combine(WorkingRootPath, "extract");
+            Directory.CreateDirectory(ExtractPath);
+            ZipFile.ExtractToDirectory(DownloadArchivePath, ExtractPath);
+
+            string PayloadRoot = ResolvePayloadRoot(ExtractPath);
+            if (!File.Exists(Path.Combine(PayloadRoot, MainExecutableName)))
+                throw new InvalidDataException($"{MainExecutableName} was not found in the update archive.");
+
+            SetStatus("Preparing apply step...");
+            string ScriptPath = Path.Combine(WorkingRootPath, "apply_update.cmd");
+            string ScriptBody = BuildApplyScript(
+                Process.GetCurrentProcess().Id,
+                Environment.CurrentDirectory,
+                PayloadRoot,
+                WorkingRootPath,
+                Asset.TagName);
+            File.WriteAllText(ScriptPath, ScriptBody, Encoding.ASCII);
+
+            SetStatus("Applying update...");
+            StartApplyScript(ScriptPath);
+
+            await Task.Delay(350);
+            Environment.Exit(0);
+        }
+
+        private void PrepareWorkingPaths()
+        {
+            string BasePath = Path.Combine(Path.GetTempPath(), "RAMV2_CustomUpdater");
+            WorkingRootPath = Path.Combine(BasePath, Guid.NewGuid().ToString("N"));
+
+            Directory.CreateDirectory(WorkingRootPath);
+            DownloadArchivePath = Path.Combine(WorkingRootPath, "update.zip");
+        }
+
+        private static async Task<long?> TryGetContentLengthAsync(HttpClient Client, string Url)
+        {
+            try
+            {
+                using HttpRequestMessage HeadRequest = new HttpRequestMessage(HttpMethod.Head, Url);
+                using HttpResponseMessage Response = await Client.SendAsync(HeadRequest, HttpCompletionOption.ResponseHeadersRead);
+                if (Response.IsSuccessStatusCode)
+                    return Response.Content.Headers.ContentLength;
+            }
+            catch { }
+
+            return null;
+        }
+
+        private static async Task<ReleaseAsset> FetchLatestReleaseAsset(HttpClient Client)
+        {
+            string ReleasesJson = await Client.GetStringAsync(LatestReleaseApi);
+            JObject Release = JObject.Parse(ReleasesJson);
+            string TagName = Release["tag_name"]?.Value<string>() ?? "latest";
+
+            JArray Assets = Release["assets"] as JArray;
+
+            if (Assets == null || Assets.Count == 0)
+                throw new InvalidOperationException("No release assets found on latest release.");
+
+            List<JObject> ZipAssets = Assets
+                .OfType<JObject>()
+                .Where(Asset => Asset["name"]?.Value<string>()?.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) == true)
+                .ToList();
+
+            if (ZipAssets.Count == 0)
+                throw new InvalidOperationException("No .zip asset found on latest release.");
+
+            JObject Selected = ZipAssets
+                .OrderByDescending(Asset => ScoreAsset(Asset["name"]?.Value<string>() ?? string.Empty))
+                .ThenByDescending(Asset => Asset["size"]?.Value<long>() ?? 0L)
+                .First();
+
+            string Name = Selected["name"]?.Value<string>() ?? "update.zip";
+            string Url = Selected["browser_download_url"]?.Value<string>();
+
+            if (string.IsNullOrWhiteSpace(Url))
+                throw new InvalidOperationException("Selected release asset does not include a download URL.");
+
+            return new ReleaseAsset
+            {
+                TagName = TagName,
+                Name = Name,
+                Url = Url
+            };
+        }
+
+        private static int ScoreAsset(string Name)
+        {
+            string Lower = (Name ?? string.Empty).ToLowerInvariant();
+            int Score = 0;
+
+            foreach (string Token in PreferredAssetTokens)
+                if (Lower.Contains(Token))
+                    Score++;
+
+            if (Lower.Contains("full")) Score++;
+            if (Lower.Contains("portable")) Score++;
+
+            return Score;
+        }
+
+        private static string ResolvePayloadRoot(string ExtractRoot)
+        {
+            if (File.Exists(Path.Combine(ExtractRoot, MainExecutableName)))
+                return ExtractRoot;
+
+            string[] ExeMatches = Directory.GetFiles(ExtractRoot, MainExecutableName, SearchOption.AllDirectories);
+            if (ExeMatches.Length == 0)
+                throw new InvalidDataException($"Could not find {MainExecutableName} in extracted archive.");
+
+            return Path.GetDirectoryName(
+                ExeMatches
+                    .OrderBy(PathValue => PathValue.Count(ch => ch == Path.DirectorySeparatorChar || ch == Path.AltDirectorySeparatorChar))
+                    .First());
+        }
+
+        private static string BuildApplyScript(int CurrentPid, string AppDir, string PayloadDir, string WorkRoot, string LatestTag)
+        {
+            string PreservedFilesArg = string.Join(" ", PreservedFileNames.Select(FileName => $"\"{FileName}\""));
+
+            StringBuilder Builder = new StringBuilder();
+            Builder.AppendLine("@echo off");
+            Builder.AppendLine("setlocal");
+            Builder.AppendLine($"set \"APPDIR={AppDir}\"");
+            Builder.AppendLine($"set \"PAYLOAD={PayloadDir}\"");
+            Builder.AppendLine($"set \"WORKROOT={WorkRoot}\"");
+            Builder.AppendLine(":wait_for_exit");
+            Builder.AppendLine($"tasklist /FI \"PID eq {CurrentPid}\" 2>NUL | find \"{CurrentPid}\" >NUL");
+            Builder.AppendLine("if not errorlevel 1 (");
+            Builder.AppendLine("  timeout /t 1 /nobreak >NUL");
+            Builder.AppendLine("  goto wait_for_exit");
+            Builder.AppendLine(")");
+            Builder.AppendLine($"robocopy \"%PAYLOAD%\" \"%APPDIR%\" /E /R:2 /W:1 /NFL /NDL /NJH /NJS /NP /XF {PreservedFilesArg} >NUL");
+            if (!string.IsNullOrWhiteSpace(LatestTag))
+                Builder.AppendLine($"echo {LatestTag} > \"%APPDIR%\\{ReleaseTagFileName}\"");
+            Builder.AppendLine($"start \"\" \"%APPDIR%\\{MainExecutableName}\"");
+            Builder.AppendLine("rmdir /S /Q \"%WORKROOT%\" >NUL 2>&1");
+            Builder.AppendLine("del \"%~f0\" >NUL 2>&1");
+            Builder.AppendLine("endlocal");
+
+            return Builder.ToString();
+        }
+
+        private static void StartApplyScript(string ScriptPath)
+        {
+            ProcessStartInfo StartInfo = new ProcessStartInfo
+            {
+                FileName = "cmd.exe",
+                Arguments = $"/c \"\"{ScriptPath}\"\"",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WindowStyle = ProcessWindowStyle.Hidden,
+                WorkingDirectory = Path.GetDirectoryName(ScriptPath)
+            };
+
+            Process.Start(StartInfo);
+        }
+
+        private static double BytesToMb(long bytes) => Math.Round(bytes / 1024d / 1024d, 2);
+
+        private void OnProgressChanged(float Value)
+        {
+            Value = Math.Max(0f, Math.Min(1f, Value));
+            string SizeLabel = TotalDownloadSize > 0 ? $" of {BytesToMb(TotalDownloadSize):0.00}MB" : string.Empty;
+
+            SetStatus(Value >= 1f
+                ? "Finalizing download..."
+                : $"Downloaded {(Value * 100f):0}%{SizeLabel}");
+
+            SetProgress((int)(Value * 100f));
         }
 
         private void SetStatus(string Text)
         {
             if (Status.InvokeRequired)
             {
-                SafeCallDelegateSetStatus setStatus = new SafeCallDelegateSetStatus(SetStatus);
-                Status.Invoke(setStatus, new object[] { Text });
+                SafeCallDelegateSetStatus SetStatusDelegate = SetStatus;
+                Status.Invoke(SetStatusDelegate, new object[] { Text });
             }
             else
                 Status.Text = Text;
-
-            return;
         }
+
         private void SetProgress(int Progress)
         {
+            int Clamped = Math.Max(0, Math.Min(100, Progress));
+
             if (ProgressBar.InvokeRequired)
             {
-                SafeCallDelegateSetProgress setProgress = new SafeCallDelegateSetProgress(SetProgress);
-                ProgressBar.Invoke(setProgress, new object[] { Progress });
+                SafeCallDelegateSetProgress SetProgressDelegate = SetProgress;
+                ProgressBar.Invoke(SetProgressDelegate, new object[] { Clamped });
             }
             else
-                ProgressBar.Value = Progress;
-
-            return;
+                ProgressBar.Value = Clamped;
         }
-
-        static double B2MB(double bytes) => Math.Round(bytes / 1024f / 1024f, 2);
-
-        private void progressChanged(float value)
-        {
-            SetStatus(value == 1 ? "Extracting Files..." : $"Downloaded {string.Format("{0:0}", value * 100f)}% of {string.Format("{0:0.00}", B2MB(TotalDownloadSize))}MB");
-            SetProgress((int)(value * 100f));
-        }
-
-        private async Task Download()
-        {
-#if DEBUG
-            await Task.Run(Extract);
-#else
-            using var client = new HttpClient() { Timeout = TimeSpan.FromMinutes(20) };
-            client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36");
-            string Releases = await client.GetStringAsync("https://api.github.com/repos/ic3w0lf22/Roblox-Account-Manager/releases/tags/0.0");
-            Match match = Regex.Match(Releases, @"""browser_download_url"":\s*""?([^""]+)");
-
-            if (match.Success && match.Groups.Count >= 2)
-            {
-                if (match.Groups[1].Value.Contains(".rar"))
-                {
-                    Environment.Exit(247);
-                    return;
-                }
-
-                string DownloadUrl = match.Groups[1].Value;
-
-                TotalDownloadSize = (await client.SendAsync(new HttpRequestMessage(HttpMethod.Head, DownloadUrl))).Content.Headers.ContentLength.Value;
-
-                Progress<float> progress = new Progress<float>(progressChanged);
-
-                using (var file = new FileStream(FileName, FileMode.Create, FileAccess.Write, FileShare.None))
-                    await client.DownloadAsync(DownloadUrl, file, progress);
-
-                await Task.Run(Extract);
-            }
-#endif
-        }
-
-        private void Extract()
-        {
-            bool ErorrOccured = false;
-
-            try
-            {
-                foreach (Process p in Process.GetProcessesByName("Roblox Account Manager"))
-                    if (p.Id != Process.GetCurrentProcess().Id)
-                        p.Kill();
-            }
-            catch { }
-
-            FileInfo Current = new FileInfo(Application.ExecutablePath);
-
-#if !DEBUG
-            try
-#endif
-            {
-                using ZipArchive archive = ZipFile.OpenRead(FileName);
-                archive.ExtractToDirectory(UpdatePath);
-                bool OldExecutableExists = File.Exists(Path.Combine(Environment.CurrentDirectory, "RBX Alt Manager.exe"));
-
-                foreach (string s in Directory.GetFiles(UpdatePath))
-                {
-                    string FN = Path.Combine(Environment.CurrentDirectory, Path.GetFileName(s));
-
-#if DEBUG
-                    if (FN == Application.ExecutablePath) FN = Path.Combine(Environment.CurrentDirectory, "Test.exe");
-#endif
-
-                    if (File.Exists(Path.Combine(Environment.CurrentDirectory, FN)))
-                        File.Delete(Path.Combine(Environment.CurrentDirectory, FN));
-                }
-
-                foreach (string s in Directory.GetDirectories(UpdatePath))
-                {
-                    DirectoryInfo dir = new DirectoryInfo(Path.Combine(Environment.CurrentDirectory, Path.GetFileName(s)));
-
-                    if (dir.Exists)
-                        dir.RecursiveDelete();
-                }
-
-                DirectoryInfo UpdateDir = new DirectoryInfo(UpdatePath);
-
-                foreach (FileInfo file in UpdateDir.GetFiles())
-                    if (file.Name != Current.Name)
-                        if (file.Name != "RBX Alt Manager.exe" || (file.Name == "RBX Alt Manager.exe" && OldExecutableExists)) // allows old shortcuts to keep working
-                            file.MoveTo(Path.Combine(Environment.CurrentDirectory, file.Name));
-
-                foreach (DirectoryInfo dir in UpdateDir.GetDirectories())
-                {
-                    dir.MoveTo(Path.Combine(Environment.CurrentDirectory, dir.Name));
-
-                    foreach (FileInfo file in dir.GetFiles()) // remove old files from main directory
-                    {
-                        if (File.Exists(Path.Combine(Environment.CurrentDirectory, file.Name)))
-                            File.Delete(Path.Combine(Environment.CurrentDirectory, file.Name));
-                    }
-                }
-
-                UpdateDir.RecursiveDelete();
-            }
-#if !DEBUG
-            catch (Exception x)
-            {
-                ErorrOccured = true;
-                SetStatus("Error");
-                Invoke(new Action(() =>
-                {
-                    var Result = MessageBox.Show(this, $"Something went wrong! \n{x.Message}\n{x.StackTrace}", "Auto Updater", MessageBoxButtons.RetryCancel, MessageBoxIcon.Error);
-
-                    if (Result == DialogResult.Retry)
-                    {
-                        Application.Restart();
-                        Environment.Exit(0);
-                    }
-                    else
-                        Environment.Exit(0);
-                }));
-            }
-#endif
-
-            if (ErorrOccured)
-                return;
-
-            SetStatus("Done!");
-
-#if !DEBUG
-            File.Delete(FileName);
-#endif
-
-            string ProgramFN = Path.Combine(Environment.CurrentDirectory, "Roblox Account Manager.exe");
-
-            if (RBX_Alt_Manager.Program.Elevated)
-            {
-                if (Utilities.YesNoPrompt("Roblox Account Manager", "Create Start-Menu shortcut?", "", false))
-                {
-                    string StartMenuPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonStartMenu), "Programs", "Roblox Account Manager");
-
-                    if (!Directory.Exists(StartMenuPath))
-                        Directory.CreateDirectory(StartMenuPath);
-
-                    IWshShortcut shortcut = (IWshShortcut)new WshShell().CreateShortcut(Path.Combine(StartMenuPath, "Roblox Account Manager.lnk"));
-
-                    shortcut.Description = "Roblox Account Manager";
-                    shortcut.TargetPath = ProgramFN;
-                    shortcut.WorkingDirectory = Directory.GetParent(ProgramFN).FullName;
-                    shortcut.Save();
-                }
-
-                if (File.Exists(ProgramFN))
-                    RunAsDesktopUser(ProgramFN);
-            }
-            else
-                Process.Start(ProgramFN);
-
-            Environment.Exit(0);
-        }
-
-        private static void RunAsDesktopUser(string fileName) // ahhh, pasting. (https://stackoverflow.com/a/40501607)
-        {
-            if (string.IsNullOrWhiteSpace(fileName))
-                throw new ArgumentException("Value cannot be null or whitespace.", nameof(fileName));
-
-            // To start process as shell user you will need to carry out these steps:
-            // 1. Enable the SeIncreaseQuotaPrivilege in your current token
-            // 2. Get an HWND representing the desktop shell (GetShellWindow)
-            // 3. Get the Process ID(PID) of the process associated with that window(GetWindowThreadProcessId)
-            // 4. Open that process(OpenProcess)
-            // 5. Get the access token from that process (OpenProcessToken)
-            // 6. Make a primary token with that token(DuplicateTokenEx)
-            // 7. Start the new process with that primary token(CreateProcessWithTokenW)
-
-            var hProcessToken = IntPtr.Zero;
-            // Enable SeIncreaseQuotaPrivilege in this process.  (This won't work if current process is not elevated.)
-            try
-            {
-                var process = GetCurrentProcess();
-                if (!OpenProcessToken(process, 0x0020, ref hProcessToken))
-                    return;
-
-                var tkp = new TOKEN_PRIVILEGES
-                {
-                    PrivilegeCount = 1,
-                    Privileges = new LUID_AND_ATTRIBUTES[1]
-                };
-
-                if (!LookupPrivilegeValue(null, "SeIncreaseQuotaPrivilege", ref tkp.Privileges[0].Luid))
-                    return;
-
-                tkp.Privileges[0].Attributes = 0x00000002;
-
-                if (!AdjustTokenPrivileges(hProcessToken, false, ref tkp, 0, IntPtr.Zero, IntPtr.Zero))
-                    return;
-            }
-            finally
-            {
-                CloseHandle(hProcessToken);
-            }
-
-            // Get an HWND representing the desktop shell.
-            // CAVEATS:  This will fail if the shell is not running (crashed or terminated), or the default shell has been
-            // replaced with a custom shell.  This also won't return what you probably want if Explorer has been terminated and
-            // restarted elevated.
-            var hwnd = GetShellWindow();
-            if (hwnd == IntPtr.Zero)
-                return;
-
-            var hShellProcess = IntPtr.Zero;
-            var hShellProcessToken = IntPtr.Zero;
-            var hPrimaryToken = IntPtr.Zero;
-            try
-            {
-                // Get the PID of the desktop shell process.
-                if (GetWindowThreadProcessId(hwnd, out uint dwPID) == 0)
-                    return;
-
-                // Open the desktop shell process in order to query it (get the token)
-                hShellProcess = OpenProcess(ProcessAccessFlags.QueryInformation, false, dwPID);
-                if (hShellProcess == IntPtr.Zero)
-                    return;
-
-                // Get the process token of the desktop shell.
-                if (!OpenProcessToken(hShellProcess, 0x0002, ref hShellProcessToken))
-                    return;
-
-                var dwTokenRights = 395U;
-
-                // Duplicate the shell's process token to get a primary token.
-                // Based on experimentation, this is the minimal set of rights required for CreateProcessWithTokenW (contrary to current documentation).
-                if (!DuplicateTokenEx(hShellProcessToken, dwTokenRights, IntPtr.Zero, SECURITY_IMPERSONATION_LEVEL.SecurityImpersonation, TOKEN_TYPE.TokenPrimary, out hPrimaryToken))
-                    return;
-
-                // Start the target process with the new token.
-                var si = new STARTUPINFO();
-                var pi = new PROCESS_INFORMATION();
-                if (!CreateProcessWithTokenW(hPrimaryToken, 0, fileName, "", 0, IntPtr.Zero, Path.GetDirectoryName(fileName), ref si, out pi))
-                    return;
-            }
-            finally
-            {
-                CloseHandle(hShellProcessToken);
-                CloseHandle(hPrimaryToken);
-                CloseHandle(hShellProcess);
-            }
-        }
-
-        #region Interop
-
-        private struct TOKEN_PRIVILEGES
-        {
-            public UInt32 PrivilegeCount;
-            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 1)]
-            public LUID_AND_ATTRIBUTES[] Privileges;
-        }
-
-        [StructLayout(LayoutKind.Sequential, Pack = 4)]
-        private struct LUID_AND_ATTRIBUTES
-        {
-            public LUID Luid;
-            public UInt32 Attributes;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct LUID
-        {
-            public uint LowPart;
-            public int HighPart;
-        }
-
-        [Flags]
-        private enum ProcessAccessFlags : uint
-        {
-            All = 0x001F0FFF,
-            Terminate = 0x00000001,
-            CreateThread = 0x00000002,
-            VirtualMemoryOperation = 0x00000008,
-            VirtualMemoryRead = 0x00000010,
-            VirtualMemoryWrite = 0x00000020,
-            DuplicateHandle = 0x00000040,
-            CreateProcess = 0x000000080,
-            SetQuota = 0x00000100,
-            SetInformation = 0x00000200,
-            QueryInformation = 0x00000400,
-            QueryLimitedInformation = 0x00001000,
-            Synchronize = 0x00100000
-        }
-
-        private enum SECURITY_IMPERSONATION_LEVEL
-        {
-            SecurityAnonymous,
-            SecurityIdentification,
-            SecurityImpersonation,
-            SecurityDelegation
-        }
-
-        private enum TOKEN_TYPE
-        {
-            TokenPrimary = 1,
-            TokenImpersonation
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct PROCESS_INFORMATION
-        {
-            public IntPtr hProcess;
-            public IntPtr hThread;
-            public int dwProcessId;
-            public int dwThreadId;
-        }
-
-        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-        private struct STARTUPINFO
-        {
-            public Int32 cb;
-            public string lpReserved;
-            public string lpDesktop;
-            public string lpTitle;
-            public Int32 dwX;
-            public Int32 dwY;
-            public Int32 dwXSize;
-            public Int32 dwYSize;
-            public Int32 dwXCountChars;
-            public Int32 dwYCountChars;
-            public Int32 dwFillAttribute;
-            public Int32 dwFlags;
-            public Int16 wShowWindow;
-            public Int16 cbReserved2;
-            public IntPtr lpReserved2;
-            public IntPtr hStdInput;
-            public IntPtr hStdOutput;
-            public IntPtr hStdError;
-        }
-
-        [DllImport("kernel32.dll", ExactSpelling = true)]
-        private static extern IntPtr GetCurrentProcess();
-
-        [DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true)]
-        private static extern bool OpenProcessToken(IntPtr h, int acc, ref IntPtr phtok);
-
-        [DllImport("advapi32.dll", SetLastError = true)]
-        private static extern bool LookupPrivilegeValue(string host, string name, ref LUID pluid);
-
-        [DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true)]
-        private static extern bool AdjustTokenPrivileges(IntPtr htok, bool disall, ref TOKEN_PRIVILEGES newst, int len, IntPtr prev, IntPtr relen);
-
-        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool CloseHandle(IntPtr hObject);
-
-
-        [DllImport("user32.dll")]
-        private static extern IntPtr GetShellWindow();
-
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern IntPtr OpenProcess(ProcessAccessFlags processAccess, bool bInheritHandle, uint processId);
-
-        [DllImport("advapi32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-        private static extern bool DuplicateTokenEx(IntPtr hExistingToken, uint dwDesiredAccess, IntPtr lpTokenAttributes, SECURITY_IMPERSONATION_LEVEL impersonationLevel, TOKEN_TYPE tokenType, out IntPtr phNewToken);
-
-        [DllImport("advapi32", SetLastError = true, CharSet = CharSet.Unicode)]
-        private static extern bool CreateProcessWithTokenW(IntPtr hToken, int dwLogonFlags, string lpApplicationName, string lpCommandLine, int dwCreationFlags, IntPtr lpEnvironment, string lpCurrentDirectory, [In] ref STARTUPINFO lpStartupInfo, out PROCESS_INFORMATION lpProcessInformation);
-
-        #endregion
     }
 }

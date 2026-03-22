@@ -46,16 +46,11 @@ namespace RBX_Alt_Manager.Forms
 
         private void SettingsForm_Load(object sender, EventArgs e)
         {
-            if (AccountManager.General.Get<bool>("CheckForUpdates"))
-            {
-                AccountManager.General.Set("CheckForUpdates", "false");
-                AccountManager.IniSettings.Save("RAMSettings.ini");
-            }
-
-            AutoUpdateCB.Checked = false;
-            AutoUpdateCB.Enabled = false;
-            ForceUpdateButton.Enabled = false;
-            ForceUpdateButton.Visible = false;
+            AutoUpdateCB.Checked = AccountManager.General.Get<bool>("CheckForUpdates");
+            AutoUpdateCB.Enabled = true;
+            ForceUpdateButton.Enabled = true;
+            ForceUpdateButton.Visible = true;
+            ForceUpdateButton.Text = "Update From Custom Release";
             AsyncJoinCB.Checked = AccountManager.General.Get<bool>("AsyncJoin");
             LaunchDelayNumber.Value = AccountManager.General.Get<decimal>("AccountJoinDelay");
             SavePasswordCB.Checked = AccountManager.General.Get<bool>("SavePasswords");
@@ -117,13 +112,7 @@ namespace RBX_Alt_Manager.Forms
         {
             if (!SettingsLoaded) return;
 
-            if (AutoUpdateCB.Checked)
-            {
-                AutoUpdateCB.Checked = false;
-                return;
-            }
-
-            AccountManager.General.Set("CheckForUpdates", "false");
+            AccountManager.General.Set("CheckForUpdates", AutoUpdateCB.Checked ? "true" : "false");
             AccountManager.IniSettings.Save("RAMSettings.ini");
         }
 
@@ -403,7 +392,15 @@ namespace RBX_Alt_Manager.Forms
 
         private void ForceUpdateButton_Click(object sender, EventArgs e)
         {
-            MessageBox.Show("Auto updater has been removed from this build.", "Roblox Account Manager", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            try
+            {
+                using (Auto_Update.AutoUpdater Updater = new Auto_Update.AutoUpdater())
+                    Updater.ShowDialog(this);
+            }
+            catch (Exception x)
+            {
+                MessageBox.Show($"Failed to launch updater.\n\n{x.Message}", "Roblox Account Manager", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
 
         #endregion
