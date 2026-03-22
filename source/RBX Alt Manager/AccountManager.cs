@@ -105,7 +105,7 @@ namespace RBX_Alt_Manager
         private readonly ConcurrentDictionary<long, ScriptLiveStatusOverride> ScriptLiveStatusOverrides = new ConcurrentDictionary<long, ScriptLiveStatusOverride>();
         private static readonly TimeSpan ScriptLiveStatusOverrideTtl = TimeSpan.FromSeconds(15);
         private const long AutoRejoinPlaceId = 109983668079237;
-        private static readonly TimeSpan AutoRejoinOfflineThreshold = TimeSpan.FromSeconds(60);
+        private static readonly TimeSpan AutoRejoinOfflineThreshold = TimeSpan.FromSeconds(85);
         private static readonly TimeSpan AutoRejoinRetryCooldown = TimeSpan.FromSeconds(30);
         private readonly ConcurrentDictionary<long, AutoRejoinState> AutoRejoinStates = new ConcurrentDictionary<long, AutoRejoinState>();
         private readonly ConcurrentDictionary<long, byte> AutoRejoinInProgress = new ConcurrentDictionary<long, byte>();
@@ -1202,10 +1202,12 @@ namespace RBX_Alt_Manager
                 AutoRejoinState State = AutoRejoinStates.GetOrAdd(account.UserID, _ => new AutoRejoinState());
                 bool InGame = IsAccountInGame(account);
                 DateTime? LastSignalUtc = account.LastLiveStatusUpdateUtc != DateTime.MinValue ? account.LastLiveStatusUpdateUtc : (DateTime?)null;
+                bool ManagedAccount = !string.IsNullOrEmpty(account.BrowserTrackerID);
                 bool SignalStale = LastSignalUtc.HasValue && (NowUtc - LastSignalUtc.Value) > AutoRejoinOfflineThreshold;
-                bool MissingSignalWhileOpen = account.HasOpenInstance && !LastSignalUtc.HasValue;
+                bool MissingSignal = !LastSignalUtc.HasValue;
 
-                if (account.HasOpenInstance || InGame || LastSignalUtc.HasValue)
+                // Treat accounts with a tracker id as managed sessions so "No signal" also rejoin-triggers.
+                if (account.HasOpenInstance || InGame || LastSignalUtc.HasValue || ManagedAccount)
                     State.HasSeenActiveSession = true;
 
                 if (!State.HasSeenActiveSession)
@@ -1221,7 +1223,7 @@ namespace RBX_Alt_Manager
                     continue;
                 }
 
-                if (MissingSignalWhileOpen)
+                if (MissingSignal)
                     State.OfflineSinceUtc ??= NowUtc;
                 else
                     State.OfflineSinceUtc ??= LastSignalUtc ?? NowUtc;
@@ -1237,7 +1239,7 @@ namespace RBX_Alt_Manager
 
                 State.LastAttemptUtc = NowUtc;
 
-                Program.Logger.Info($"[AutoRejoin] Watchdog trigger for {account.Username}: lastSignal={(LastSignalUtc.HasValue ? LastSignalUtc.Value.ToString("o") : "none")}, open={account.HasOpenInstance}, inGame={InGame}, stale={SignalStale}, missingWhileOpen={MissingSignalWhileOpen}");
+                Program.Logger.Info($"[AutoRejoin] Watchdog trigger for {account.Username}: lastSignal={(LastSignalUtc.HasValue ? LastSignalUtc.Value.ToString("o") : "none")}, open={account.HasOpenInstance}, inGame={InGame}, stale={SignalStale}, missingSignal={MissingSignal}, managed={ManagedAccount}");
                 _ = RelaunchForAutoRejoin(account);
             }
 

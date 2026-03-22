@@ -32,7 +32,7 @@ namespace RBX_Alt_Manager.Forms
                 Text = "Auto Rejoin"
             };
 
-            Helper.SetToolTip(AutoRejoinCB, $"If an active account has no in-game signal for 60 seconds, RAM relaunches it to place {AutoRejoinPlaceId}.");
+            Helper.SetToolTip(AutoRejoinCB, $"If an active account has no in-game signal for 1m 25s, RAM relaunches it to place {AutoRejoinPlaceId}.");
             AutoRejoinCB.CheckedChanged += AutoRejoinCB_CheckedChanged;
 
             int InsertAfter = SettingsLayoutPanel.Controls.IndexOf(AutoCookieRefreshCB);
