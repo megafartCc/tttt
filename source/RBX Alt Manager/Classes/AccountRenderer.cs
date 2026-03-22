@@ -25,10 +25,12 @@ namespace RBX_Alt_Manager.Classes
 
             Color? indicatorColor = null;
 
+            // Strict status colors:
+            // green = open instance and in-game
+            // blue = open instance but not in-game
+            // no dot = offline / no open instance
             if (account.HasOpenInstance)
                 indicatorColor = account.IsOnServer ? Presence.Colors[UserPresenceType.InGame] : Presence.Colors[UserPresenceType.Online];
-            else if (AccountManager.General.Get<bool>("ShowPresence") && account.Presence != null && account.Presence.userPresenceType != UserPresenceType.Offline && Presence.Colors.ContainsKey(account.Presence.userPresenceType))
-                indicatorColor = Presence.Colors[account.Presence.userPresenceType];
 
             if (indicatorColor.HasValue)
                 using (Brush b = new SolidBrush(indicatorColor.Value))

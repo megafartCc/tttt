@@ -315,7 +315,7 @@ namespace RBX_Alt_Manager
         {
             if (account == null) return string.Empty;
             if (account.LastLiveStatusUpdateUtc == DateTime.MinValue)
-                return account.HasOpenInstance ? "No signal" : string.Empty;
+                return "No signal";
 
             return FormatLastSeenAge(account.LastLiveStatusUpdateUtc);
         }
@@ -1206,15 +1206,8 @@ namespace RBX_Alt_Manager
                 bool SignalStale = LastSignalUtc.HasValue && (NowUtc - LastSignalUtc.Value) > AutoRejoinOfflineThreshold;
                 bool MissingSignal = !LastSignalUtc.HasValue;
 
-                // Treat accounts with a tracker id as managed sessions so "No signal" also rejoin-triggers.
                 if (account.HasOpenInstance || InGame || LastSignalUtc.HasValue || ManagedAccount)
                     State.HasSeenActiveSession = true;
-
-                if (!State.HasSeenActiveSession)
-                {
-                    State.OfflineSinceUtc = null;
-                    continue;
-                }
 
                 // In-game with a fresh signal should never be auto-rejoined.
                 if (InGame && !SignalStale)
@@ -1223,6 +1216,8 @@ namespace RBX_Alt_Manager
                     continue;
                 }
 
+                // Always start/reuse offline timer once account is not actively in-game.
+                // This ensures fully offline accounts (no signal at all) still auto-rejoin.
                 if (MissingSignal)
                     State.OfflineSinceUtc ??= NowUtc;
                 else
@@ -3185,7 +3180,7 @@ namespace RBX_Alt_Manager
                     if (ServerState.HasValue)
                     {
                         long? PresencePlaceId = GetPresencePlaceId(account);
-                        IsOnServer = ServerState.Value && (PresencePlaceId.HasValue || HasResolvedGame(account));
+                        IsOnServer = ServerState.Value && PresencePlaceId.HasValue;
 
                         if (!PresencePlaceId.HasValue)
                             PresenceFallback.Add(account);
