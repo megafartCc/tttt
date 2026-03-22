@@ -123,13 +123,17 @@ namespace RBX_Alt_Manager
 
                 if (!AppConfigValid || !Log4ConfigValid)
                 {
-                    Logger.Warn($"Restarting app due to config hash mismatch\n[App.config]\n\tCurrent:  {AppConfigHash}\n\tExpected: {Resources.AppConfigHash}\n[log4.config]\n\tCurrent:  {LogConfigHash}\n\tExpected: {Resources.Log4ConfigHash}");
+                    Logger.Warn($"Config hash mismatch detected, skipping forced restart in custom build.\n[App.config]\n\tCurrent:  {AppConfigHash}\n\tExpected: {Resources.AppConfigHash}\n[log4.config]\n\tCurrent:  {LogConfigHash}\n\tExpected: {Resources.Log4ConfigHash}");
 
-                    File.WriteAllBytes(AppConfigPath, Resources.App);
-                    File.WriteAllBytes(LogConfigPath, Resources.log4);
+                    if (!File.Exists(AppConfigPath))
+                    {
+                        try { File.WriteAllBytes(AppConfigPath, Resources.App); } catch { }
+                    }
 
-                    Process.Start(Application.ExecutablePath, "-restart");
-                    Environment.Exit(0);
+                    if (!File.Exists(LogConfigPath))
+                    {
+                        try { File.WriteAllBytes(LogConfigPath, Resources.log4); } catch { }
+                    }
                 }
             }
 

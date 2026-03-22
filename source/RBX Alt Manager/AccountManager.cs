@@ -107,8 +107,10 @@ namespace RBX_Alt_Manager
         private const long AutoRejoinPlaceId = 109983668079237;
         private static readonly TimeSpan AutoRejoinOfflineThreshold = TimeSpan.FromSeconds(105);
         private static readonly TimeSpan AutoRejoinRetryCooldown = TimeSpan.FromSeconds(30);
+        private static readonly TimeSpan AutoRejoinStartupGrace = TimeSpan.FromSeconds(45);
         private readonly ConcurrentDictionary<long, AutoRejoinState> AutoRejoinStates = new ConcurrentDictionary<long, AutoRejoinState>();
         private readonly ConcurrentDictionary<long, byte> AutoRejoinInProgress = new ConcurrentDictionary<long, byte>();
+        private readonly DateTime AutoRejoinStartedUtc = DateTime.UtcNow;
 
         private sealed class ScriptLiveStatusOverride
         {
@@ -1197,6 +1199,9 @@ namespace RBX_Alt_Manager
             }
 
             DateTime NowUtc = DateTime.UtcNow;
+            if ((NowUtc - AutoRejoinStartedUtc) < AutoRejoinStartupGrace)
+                return;
+
             HashSet<long> ExistingAccounts = new HashSet<long>();
 
             foreach (Account account in AccountsList)
@@ -1209,7 +1214,15 @@ namespace RBX_Alt_Manager
                 bool InGame = IsAccountInGame(account);
                 DateTime? LastSignalUtc = account.LastLiveStatusUpdateUtc != DateTime.MinValue ? account.LastLiveStatusUpdateUtc : (DateTime?)null;
                 bool ManagedAccount = !string.IsNullOrEmpty(account.BrowserTrackerID);
-                bool HasFreshSignal = LastSignalUtc.HasValue && (NowUtc - LastSignalUtc.Value) <= AutoRejoinOfflineThreshold;
+                TimeSpan SignalAge = TimeSpan.MaxValue;
+                if (LastSignalUtc.HasValue)
+                {
+                    SignalAge = NowUtc - LastSignalUtc.Value;
+                    if (SignalAge < TimeSpan.Zero)
+                        SignalAge = TimeSpan.Zero;
+                }
+
+                bool HasFreshSignal = LastSignalUtc.HasValue && SignalAge <= AutoRejoinOfflineThreshold;
                 bool SignalStale = LastSignalUtc.HasValue && !HasFreshSignal;
                 bool MissingSignal = !LastSignalUtc.HasValue;
 
@@ -1226,7 +1239,7 @@ namespace RBX_Alt_Manager
                 // Start offline timer from the last signal timestamp (or now if there is none).
                 if (!State.OfflineSinceUtc.HasValue)
                 {
-                    State.OfflineSinceUtc = LastSignalUtc ?? NowUtc;
+                    State.OfflineSinceUtc = LastSignalUtc.HasValue && LastSignalUtc.Value <= NowUtc ? LastSignalUtc.Value : NowUtc;
                 }
 
                 if ((NowUtc - State.OfflineSinceUtc.Value) < AutoRejoinOfflineThreshold)
