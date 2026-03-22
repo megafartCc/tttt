@@ -42,6 +42,13 @@ namespace RBX_Alt_Manager
 
         [DllImport("user32.dll", SetLastError = true)]
         static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
+        [DllImport("psapi.dll", SetLastError = true)]
+        static extern bool EmptyWorkingSet(IntPtr hProcess);
+
+        private const int TinyLaunchPosX = 0;
+        private const int TinyLaunchPosY = 0;
+        private const int TinyLaunchWidth = 220;
+        private const int TinyLaunchHeight = 140;
 
         public int CompareTo(Account compareTo)
         {
@@ -696,11 +703,16 @@ namespace RBX_Alt_Manager
 
         public async void AdjustWindowPosition()
         {
-            if (!RobloxWatcher.RememberWindowPositions)
-                return;
+            bool HasSavedWindowPosition = RobloxWatcher.RememberWindowPositions
+                && int.TryParse(GetField("Window_Position_X"), out int SavedPosX)
+                && int.TryParse(GetField("Window_Position_Y"), out int SavedPosY)
+                && int.TryParse(GetField("Window_Width"), out int SavedWidth)
+                && int.TryParse(GetField("Window_Height"), out int SavedHeight);
 
-            if (!(int.TryParse(GetField("Window_Position_X"), out int PosX) && int.TryParse(GetField("Window_Position_Y"), out int PosY) && int.TryParse(GetField("Window_Width"), out int Width) && int.TryParse(GetField("Window_Height"), out int Height)))
-                return;
+            int PosX = HasSavedWindowPosition ? SavedPosX : TinyLaunchPosX;
+            int PosY = HasSavedWindowPosition ? SavedPosY : TinyLaunchPosY;
+            int Width = HasSavedWindowPosition ? SavedWidth : TinyLaunchWidth;
+            int Height = HasSavedWindowPosition ? SavedHeight : TinyLaunchHeight;
 
             bool Found = false;
             DateTime Ends = DateTime.Now.AddSeconds(45);
@@ -721,6 +733,38 @@ namespace RBX_Alt_Manager
                     if (TrackerID != BrowserTrackerID) continue;
 
                     Found = true;
+
+                    try
+                    {
+                        if (!process.HasExited)
+                        {
+                            try
+                            {
+                                process.PriorityBoostEnabled = false;
+                            }
+                            catch { }
+
+                            try
+                            {
+                                process.PriorityClass = ProcessPriorityClass.Idle;
+                            }
+                            catch
+                            {
+                                try
+                                {
+                                    process.PriorityClass = ProcessPriorityClass.BelowNormal;
+                                }
+                                catch { }
+                            }
+
+                            try
+                            {
+                                EmptyWorkingSet(process.Handle);
+                            }
+                            catch { }
+                        }
+                    }
+                    catch { }
 
                     MoveWindow(process.MainWindowHandle, PosX, PosY, Width, Height, true);
 
