@@ -546,7 +546,8 @@ namespace RBX_Alt_Manager
                     {
                         foreach(Process proc in Process.GetProcessesByName("RobloxPlayerBeta"))
                         {
-                            var TrackerMatch = Regex.Match(proc.GetCommandLine(), @"\-b (\d+)");
+                            string CommandLine = proc.GetCommandLine() ?? string.Empty;
+                            var TrackerMatch = Regex.Match(CommandLine, @"\-b (\d+)");
                             string TrackerID = TrackerMatch.Success ? TrackerMatch.Groups[1].Value : string.Empty;
 
                             if (TrackerID == BrowserTrackerID)
@@ -735,7 +736,7 @@ namespace RBX_Alt_Manager
                 {
                     if (process.MainWindowHandle == IntPtr.Zero) continue;
 
-                    string CommandLine = process.GetCommandLine();
+                    string CommandLine = process.GetCommandLine() ?? string.Empty;
 
                     var TrackerMatch = Regex.Match(CommandLine, @"\-b (\d+)");
                     string TrackerID = TrackerMatch.Success ? TrackerMatch.Groups[1].Value : string.Empty;

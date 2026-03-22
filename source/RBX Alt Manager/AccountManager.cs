@@ -105,14 +105,11 @@ namespace RBX_Alt_Manager
         private readonly ConcurrentDictionary<long, ScriptLiveStatusOverride> ScriptLiveStatusOverrides = new ConcurrentDictionary<long, ScriptLiveStatusOverride>();
         private static readonly TimeSpan ScriptLiveStatusOverrideTtl = TimeSpan.FromSeconds(15);
         private const long AutoRejoinPlaceId = 109983668079237;
-        private static readonly TimeSpan AutoRejoinOfflineThreshold = TimeSpan.FromSeconds(85);
+        private static readonly TimeSpan AutoRejoinOfflineThreshold = TimeSpan.FromSeconds(130);
+        private static readonly TimeSpan AutoRejoinOpenInstanceGrace = TimeSpan.FromSeconds(30);
         private static readonly TimeSpan AutoRejoinRetryCooldown = TimeSpan.FromSeconds(30);
         private readonly ConcurrentDictionary<long, AutoRejoinState> AutoRejoinStates = new ConcurrentDictionary<long, AutoRejoinState>();
         private readonly ConcurrentDictionary<long, byte> AutoRejoinInProgress = new ConcurrentDictionary<long, byte>();
-        private readonly ConcurrentDictionary<string, ServerClaimState> ScriptServerClaims = new ConcurrentDictionary<string, ServerClaimState>();
-        private readonly object ScriptServerClaimsLock = new object();
-        private static readonly TimeSpan ScriptServerClaimMinLease = TimeSpan.FromSeconds(10);
-        private static readonly TimeSpan ScriptServerClaimMaxLease = TimeSpan.FromMinutes(30);
 
         private sealed class ScriptLiveStatusOverride
         {
@@ -128,12 +125,6 @@ namespace RBX_Alt_Manager
             public bool HasSeenActiveSession { get; set; }
             public DateTime? OfflineSinceUtc { get; set; }
             public DateTime LastAttemptUtc { get; set; } = DateTime.MinValue;
-        }
-
-        private sealed class ServerClaimState
-        {
-            public string Owner { get; set; }
-            public DateTime ExpiresAtUtc { get; set; }
         }
 
         private static readonly byte[] Entropy = new byte[] { 0x52, 0x4f, 0x42, 0x4c, 0x4f, 0x58, 0x20, 0x41, 0x43, 0x43, 0x4f, 0x55, 0x4e, 0x54, 0x20, 0x4d, 0x41, 0x4e, 0x41, 0x47, 0x45, 0x52, 0x20, 0x7c, 0x20, 0x3a, 0x29, 0x20, 0x7c, 0x20, 0x42, 0x52, 0x4f, 0x55, 0x47, 0x48, 0x54, 0x20, 0x54, 0x4f, 0x20, 0x59, 0x4f, 0x55, 0x20, 0x42, 0x55, 0x59, 0x20, 0x69, 0x63, 0x33, 0x77, 0x30, 0x6c, 0x66 };
@@ -1203,7 +1194,11 @@ namespace RBX_Alt_Manager
                 bool InGame = IsAccountInGame(account);
                 DateTime? LastSignalUtc = account.LastLiveStatusUpdateUtc != DateTime.MinValue ? account.LastLiveStatusUpdateUtc : (DateTime?)null;
                 bool ManagedAccount = !string.IsNullOrEmpty(account.BrowserTrackerID);
-                bool SignalStale = LastSignalUtc.HasValue && (NowUtc - LastSignalUtc.Value) > AutoRejoinOfflineThreshold;
+                TimeSpan EffectiveOfflineThreshold = AutoRejoinOfflineThreshold;
+                if (account.HasOpenInstance && !InGame)
+                    EffectiveOfflineThreshold = AutoRejoinOfflineThreshold + AutoRejoinOpenInstanceGrace;
+
+                bool SignalStale = LastSignalUtc.HasValue && (NowUtc - LastSignalUtc.Value) > EffectiveOfflineThreshold;
                 bool MissingSignal = !LastSignalUtc.HasValue;
 
                 if (account.HasOpenInstance || InGame || LastSignalUtc.HasValue || ManagedAccount)
@@ -1216,14 +1211,20 @@ namespace RBX_Alt_Manager
                     continue;
                 }
 
-                // Always start/reuse offline timer once account is not actively in-game.
-                // This ensures fully offline accounts (no signal at all) still auto-rejoin.
-                if (MissingSignal)
-                    State.OfflineSinceUtc ??= NowUtc;
-                else
-                    State.OfflineSinceUtc ??= LastSignalUtc ?? NowUtc;
+                // Start/reuse offline timer once account is not actively in-game.
+                // If we still have an open instance but signal is stale, start from "now"
+                // to avoid immediate false relaunches after report gaps/restarts.
+                if (!State.OfflineSinceUtc.HasValue)
+                {
+                    if (MissingSignal)
+                        State.OfflineSinceUtc = NowUtc;
+                    else if (account.HasOpenInstance && SignalStale)
+                        State.OfflineSinceUtc = NowUtc;
+                    else
+                        State.OfflineSinceUtc = LastSignalUtc ?? NowUtc;
+                }
 
-                if ((NowUtc - State.OfflineSinceUtc.Value) < AutoRejoinOfflineThreshold)
+                if ((NowUtc - State.OfflineSinceUtc.Value) < EffectiveOfflineThreshold)
                     continue;
 
                 if ((NowUtc - State.LastAttemptUtc) < AutoRejoinRetryCooldown)
@@ -1245,73 +1246,6 @@ namespace RBX_Alt_Manager
 
                 AutoRejoinStates.TryRemove(UserId, out _);
                 AutoRejoinInProgress.TryRemove(UserId, out _);
-            }
-        }
-
-        private static string BuildScriptServerClaimKey(long PlaceId, string JobId)
-        {
-            string NormalizedJobId = (JobId ?? string.Empty).Trim().ToLowerInvariant();
-            if (PlaceId <= 0 || string.IsNullOrEmpty(NormalizedJobId))
-                return string.Empty;
-
-            return $"{PlaceId}:{NormalizedJobId}";
-        }
-
-        private static TimeSpan ClampScriptServerLease(int LeaseSeconds)
-        {
-            if (LeaseSeconds <= 0)
-                return ScriptServerClaimMinLease;
-
-            TimeSpan Lease = TimeSpan.FromSeconds(LeaseSeconds);
-            if (Lease < ScriptServerClaimMinLease)
-                return ScriptServerClaimMinLease;
-            if (Lease > ScriptServerClaimMaxLease)
-                return ScriptServerClaimMaxLease;
-            return Lease;
-        }
-
-        private bool TryClaimScriptServer(long PlaceId, string JobId, string Owner, int LeaseSeconds, out DateTime ExpiresAtUtc, out string ExistingOwner)
-        {
-            ExpiresAtUtc = DateTime.MinValue;
-            ExistingOwner = string.Empty;
-
-            string Key = BuildScriptServerClaimKey(PlaceId, JobId);
-            if (string.IsNullOrEmpty(Key))
-                return false;
-
-            string NormalizedOwner = string.IsNullOrWhiteSpace(Owner) ? "unknown" : Owner.Trim();
-            DateTime NowUtc = DateTime.UtcNow;
-            DateTime NewExpiryUtc = NowUtc.Add(ClampScriptServerLease(LeaseSeconds));
-
-            lock (ScriptServerClaimsLock)
-            {
-                foreach (KeyValuePair<string, ServerClaimState> Pair in ScriptServerClaims.ToArray())
-                {
-                    if (Pair.Value == null || Pair.Value.ExpiresAtUtc <= NowUtc)
-                        ScriptServerClaims.TryRemove(Pair.Key, out _);
-                }
-
-                if (ScriptServerClaims.TryGetValue(Key, out ServerClaimState Existing)
-                    && Existing != null
-                    && Existing.ExpiresAtUtc > NowUtc)
-                {
-                    if (!string.Equals(Existing.Owner, NormalizedOwner, StringComparison.OrdinalIgnoreCase))
-                    {
-                        ExpiresAtUtc = Existing.ExpiresAtUtc;
-                        ExistingOwner = Existing.Owner;
-                        return false;
-                    }
-                }
-
-                ScriptServerClaims[Key] = new ServerClaimState
-                {
-                    Owner = NormalizedOwner,
-                    ExpiresAtUtc = NewExpiryUtc
-                };
-
-                ExpiresAtUtc = NewExpiryUtc;
-                ExistingOwner = NormalizedOwner;
-                return true;
             }
         }
 
@@ -1343,7 +1277,7 @@ namespace RBX_Alt_Manager
 
             if ((Method == "GetCookie" || Method == "GetAccounts" || Method == "LaunchAccount" || Method == "FollowUser") && ((WSPassword != null && WSPassword.Length < 6) || (Password != null && Password != WSPassword))) return Reply("Invalid Password, make sure your password contains 6 or more characters", false, 401, "Invalid Password");
 
-            if (!Developer.Get<bool>("EnableWebServer") && Method != "PushLiveStatus" && Method != "ClaimServer")
+            if (!Developer.Get<bool>("EnableWebServer") && Method != "PushLiveStatus")
                 return Reply("Method not allowed", false, 401, "Method not allowed");
 
             if (Method == "GetAccounts")
@@ -1478,58 +1412,6 @@ namespace RBX_Alt_Manager
                     AccountsView.InvokeIfRequired(() => AccountsView.RefreshObject(TargetAccountObj));
 
                 return Reply("true", true, Raw: "true");
-            }
-
-            if (Method == "ClaimServer")
-            {
-                JObject Payload = null;
-                if (!string.IsNullOrWhiteSpace(Body))
-                    Body.TryParseJson(out Payload);
-
-                string PlaceIdValue = request.QueryString["PlaceId"]
-                    ?? request.QueryString["placeid"]
-                    ?? Payload?["PlaceId"]?.ToString()
-                    ?? Payload?["placeId"]?.ToString();
-
-                string JobId = request.QueryString["JobId"]
-                    ?? request.QueryString["jobid"]
-                    ?? Payload?["JobId"]?.ToString()
-                    ?? Payload?["jobId"]?.ToString();
-
-                string Owner = request.QueryString["Owner"]
-                    ?? request.QueryString["Account"]
-                    ?? request.QueryString["Username"]
-                    ?? request.QueryString["UserId"]
-                    ?? Payload?["Owner"]?.ToString()
-                    ?? Payload?["Account"]?.ToString()
-                    ?? Payload?["Username"]?.ToString()
-                    ?? Payload?["UserId"]?.ToString()
-                    ?? Payload?["userid"]?.ToString();
-
-                string LeaseSecondsValue = request.QueryString["LeaseSeconds"]
-                    ?? request.QueryString["leaseSeconds"]
-                    ?? Payload?["LeaseSeconds"]?.ToString()
-                    ?? Payload?["leaseSeconds"]?.ToString();
-
-                if (!long.TryParse(PlaceIdValue, out long PlaceId) || PlaceId <= 0 || string.IsNullOrWhiteSpace(JobId))
-                    return Reply(JsonConvert.SerializeObject(new { ok = false, claimed = false, error = "invalid_place_or_job" }), true);
-
-                int LeaseSeconds = 120;
-                if (int.TryParse(LeaseSecondsValue, out int ParsedLease) && ParsedLease > 0)
-                    LeaseSeconds = ParsedLease;
-
-                bool Claimed = TryClaimScriptServer(PlaceId, JobId, Owner, LeaseSeconds, out DateTime ExpiresAtUtc, out string ExistingOwner);
-                string Response = JsonConvert.SerializeObject(new
-                {
-                    ok = true,
-                    claimed = Claimed,
-                    placeId = PlaceId,
-                    jobId = JobId,
-                    owner = ExistingOwner,
-                    expiresAtUtc = ExpiresAtUtc == DateTime.MinValue ? string.Empty : ExpiresAtUtc.ToString("o"),
-                });
-
-                return Reply(Response, true);
             }
 
             if (string.IsNullOrEmpty(Account)) return Reply("Empty Account", false);
