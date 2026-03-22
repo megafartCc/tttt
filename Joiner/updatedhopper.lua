@@ -51,7 +51,7 @@ local RAM_STATUS_PUSH_ENABLED = true
 local RAM_STATUS_PUSH_INTERVAL = 1
 local RAM_STATUS_PUSH_PORT = 7963
 local RAM_STATUS_PUSH_PASSWORD = ""
-local RAM_SERVER_CLAIM_ENABLED = true
+local RAM_SERVER_CLAIM_ENABLED = false
 local RAM_SERVER_CLAIM_LEASE_SECONDS = 300
 
 -- Rejoin handling (for bad target server / unavailable server prompts)
@@ -1167,17 +1167,6 @@ local function tryClaimServerForHop(jobId)
     end
 
     if isServerBlocked(jobId) then
-        return false
-    end
-
-    local ramClaimed, ramReason = tryClaimServerViaRam(jobId)
-    if ramClaimed == true then
-        markServerBlocked(jobId, math.max(1, tonumber(SHARED_SERVER_BLOCK_SECONDS) or JOINER_SERVER_BLOCK_SECONDS))
-        return true
-    end
-    if ramClaimed == false then
-        markServerBlocked(jobId, math.max(1, tonumber(SHARED_SERVER_BLOCK_SECONDS) or JOINER_SERVER_BLOCK_SECONDS))
-        joinerDebugWarn("ram claim denied target=" .. jobId .. " owner=" .. tostring(ramReason or "unknown"))
         return false
     end
 
