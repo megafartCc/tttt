@@ -702,6 +702,8 @@ namespace RBX_Alt_Manager
                 }
                 else
                 {
+                    Exception LaunchException = null;
+
                     await Task.Run(() => // prevents roblox launcher hanging our main process
                     {
                         try
@@ -716,9 +718,12 @@ namespace RBX_Alt_Manager
                                 LaunchInfo.FileName = $"roblox-player:1+launchmode:play+gameinfo:{Ticket}+launchtime:{LaunchTime}+placelauncherurl:{HttpUtility.UrlEncode($"https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestFollowUser&userId={PlaceID}")}+browsertrackerid:{BrowserTrackerID}+robloxLocale:en_us+gameLocale:en_us+channel:+LaunchExp:InApp";
                             else
                                 LaunchInfo.FileName = $"roblox-player:1+launchmode:play+gameinfo:{Ticket}+launchtime:{LaunchTime}+placelauncherurl:{HttpUtility.UrlEncode($"https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestGame{(string.IsNullOrEmpty(JobID) ? "" : "Job")}&browserTrackerId={BrowserTrackerID}&placeId={PlaceID}{(string.IsNullOrEmpty(JobID) ? "" : ("&gameId=" + JobID))}&isPlayTogetherGame=false{(AccountManager.IsTeleport ? "&isTeleport=true" : "")}")}+browsertrackerid:{BrowserTrackerID}+robloxLocale:en_us+gameLocale:en_us+channel:+LaunchExp:InApp";
-                            Process Launcher = Process.Start(LaunchInfo);
-                            
-                            Launcher.WaitForExit();
+                            using (Process Launcher = Process.Start(LaunchInfo))
+                            {
+                                // Do not let launcher hangs block bulk queue progression forever.
+                                if (Launcher != null && !Launcher.WaitForExit(6000))
+                                    Program.Logger.Warn($"[JoinServer] Launcher wait timeout for {Username}; continuing launch queue.");
+                            }
 
                             if (!Internal)
                                 AccountManager.Instance.NextAccount();
@@ -727,14 +732,13 @@ namespace RBX_Alt_Manager
                         }
                         catch (Exception x)
                         {
-                            Utilities.InvokeIfRequired(AccountManager.Instance, () => MessageBox.Show($"ERROR: Failed to launch Roblox! Try re-installing Roblox.\n\n{x.Message}{x.StackTrace}", "Roblox Account Manager", MessageBoxButtons.OK, MessageBoxIcon.Error));
-                            if (!Internal)
-                            {
-                                AccountManager.Instance.CancelLaunching();
-                                AccountManager.Instance.NextAccount();
-                            }
+                            LaunchException = x;
+                            Program.Logger.Error($"[JoinServer] Failed launching {Username}: {x}");
                         }
                     });
+
+                    if (LaunchException != null)
+                        return $"ERROR: Failed to launch Roblox! Try re-installing Roblox.\n\n{LaunchException.Message}";
 
                     return "Success";
                 }
