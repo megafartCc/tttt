@@ -654,6 +654,47 @@ namespace RBX_Alt_Manager
                 SaveAccounts(BypassRateLimit: true, BypassCountCheck: true);
         }
 
+        private void RefreshBrowserTrackerIdsForLaunchQueue(IEnumerable<Account> launchQueue)
+        {
+            List<Account> queue = DistinctAccounts(launchQueue ?? Enumerable.Empty<Account>());
+            if (queue.Count == 0)
+                return;
+
+            HashSet<Account> queueSet = new HashSet<Account>(queue);
+            HashSet<string> assigned = new HashSet<string>(StringComparer.Ordinal);
+            bool changed = false;
+
+            foreach (Account account in AccountsList)
+            {
+                if (account == null || queueSet.Contains(account))
+                    continue;
+
+                string current = (account.BrowserTrackerID ?? string.Empty).Trim();
+                if (!string.IsNullOrWhiteSpace(current))
+                    assigned.Add(current);
+            }
+
+            foreach (Account account in queue)
+            {
+                string newId;
+                do { newId = GenerateBrowserTrackerId(); }
+                while (assigned.Contains(newId));
+
+                assigned.Add(newId);
+
+                string oldId = (account.BrowserTrackerID ?? string.Empty).Trim();
+                if (!string.Equals(oldId, newId, StringComparison.Ordinal))
+                {
+                    account.BrowserTrackerID = newId;
+                    changed = true;
+                    Program.Logger.Info($"[BulkLaunch] Fresh BrowserTrackerID for {account.Username}: {newId}");
+                }
+            }
+
+            if (changed)
+                SaveAccounts(BypassRateLimit: true, BypassCountCheck: true);
+        }
+
         private static List<Account> DistinctAccounts(IEnumerable<Account> accounts)
         {
             if (accounts == null)
@@ -3932,6 +3973,7 @@ namespace RBX_Alt_Manager
             Program.Logger.Info($"[BulkLaunch] Queue size {LaunchQueue.Count}: {string.Join(", ", LaunchQueue.Select(account => account?.Username ?? "unknown"))}");
 
             NormalizeBrowserTrackerIds();
+            RefreshBrowserTrackerIdsForLaunchQueue(LaunchQueue);
 
             try
             {
@@ -3949,6 +3991,9 @@ namespace RBX_Alt_Manager
 
                     try
                     {
+                        if (General.Get<bool>("EnableMultiRbx") && !PrepareMultiRobloxForAccountLaunch(4))
+                            Program.Logger.Warn($"[BulkLaunch] Multi Roblox prep failed right before launching {account.Username}.");
+
                         // Intentionally mirror manual single-account launch behavior for each selected account.
                         string Result = await JoinWithFailureRecovery(
                             account,
@@ -3957,8 +4002,8 @@ namespace RBX_Alt_Manager
                             FollowUser,
                             VIPServer,
                             "BulkLaunch",
-                            allowGlobalReset: true,
-                            requireNewProcess: false);
+                            allowGlobalReset: false,
+                            requireNewProcess: true);
 
                         if (!IsJoinSuccess(Result))
                         {
@@ -3967,7 +4012,8 @@ namespace RBX_Alt_Manager
                         }
                         else
                         {
-                            Program.Logger.Info($"[BulkLaunch] Success launching {index}/{total}: {account.Username}");
+                            int trackerPid = FindRobloxProcessIdByTracker(account.BrowserTrackerID);
+                            Program.Logger.Info($"[BulkLaunch] Success launching {index}/{total}: {account.Username} | pid={trackerPid} | totalRoblox={GetRobloxPlayerProcessCount()}");
                         }
                     }
                     catch (Exception x)
