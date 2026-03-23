@@ -603,7 +603,7 @@ namespace RBX_Alt_Manager
             }
             catch { }
 
-            if (byIndices.Count > byObjects.Count)
+            if (byIndices.Count > 0)
                 return byIndices;
 
             return byObjects;
@@ -3693,7 +3693,9 @@ namespace RBX_Alt_Manager
             bool AsyncJoin = General.Get<bool>("AsyncJoin");
             CancellationTokenSource Token = LauncherToken;
             List<string> Failures = new List<string>();
-            bool MultiLaunch = Accounts != null && Accounts.Count > 1;
+            List<Account> LaunchQueue = DistinctAccounts((Accounts ?? new List<Account>())
+                .Where(account => account != null && AccountsList.Contains(account)));
+            bool MultiLaunch = LaunchQueue.Count > 1;
 
             if (MultiLaunch)
                 AsyncJoin = false; // Always run selected multi-launch as strict queue.
@@ -3703,10 +3705,10 @@ namespace RBX_Alt_Manager
 
             try
             {
-                int total = Accounts?.Count ?? 0;
+                int total = LaunchQueue.Count;
                 int index = 0;
 
-                foreach (Account account in Accounts ?? Enumerable.Empty<Account>())
+                foreach (Account account in LaunchQueue)
                 {
                     index++;
 
@@ -3715,18 +3717,19 @@ namespace RBX_Alt_Manager
 
                     Program.Logger.Info($"[BulkLaunch] Launching {index}/{total}: {account?.Username ?? "unknown"}");
 
-                    long PlaceId = PlaceID;
-                    string JobId = JobID;
-
-                    if (!FollowUser)
-                    {
-                        if (!string.IsNullOrEmpty(account.GetField("SavedPlaceId")) && long.TryParse(account.GetField("SavedPlaceId"), out long PID)) PlaceId = PID;
-                        if (!string.IsNullOrEmpty(account.GetField("SavedJobId"))) JobId = account.GetField("SavedJobId");
-                    }
-
                     try
                     {
-                        string Result = await JoinWithFailureRecovery(account, PlaceId, JobId, FollowUser, VIPServer, "BulkLaunch", allowGlobalReset: false, requireNewProcess: true);
+                        // Intentionally mirror manual single-account launch behavior for each selected account.
+                        string Result = await JoinWithFailureRecovery(
+                            account,
+                            PlaceID,
+                            JobID,
+                            FollowUser,
+                            VIPServer,
+                            "BulkLaunch",
+                            allowGlobalReset: true,
+                            requireNewProcess: false);
+
                         if (!IsJoinSuccess(Result))
                         {
                             Program.Logger.Warn($"[BulkLaunch] Failed launching {account.Username}: {Result}");
