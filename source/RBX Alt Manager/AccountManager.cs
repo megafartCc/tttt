@@ -714,17 +714,69 @@ namespace RBX_Alt_Manager
             return DistinctAccounts(byObjects.Concat(byIndices).Concat(byItems));
         }
 
+        private Account ResolveAccountReference(Account account)
+        {
+            if (account == null || AccountsList == null)
+                return null;
+
+            if (AccountsList.Contains(account))
+                return account;
+
+            if (account.UserID > 0)
+            {
+                Account byId = AccountsList.FirstOrDefault(existing => existing?.UserID == account.UserID);
+                if (byId != null)
+                    return byId;
+            }
+
+            string username = (account.Username ?? string.Empty).Trim();
+            if (!string.IsNullOrEmpty(username))
+            {
+                Account byName = AccountsList.FirstOrDefault(existing =>
+                    existing != null && string.Equals(existing.Username, username, StringComparison.OrdinalIgnoreCase));
+                if (byName != null)
+                    return byName;
+            }
+
+            return null;
+        }
+
+        private List<Account> ResolveAccountsToList(IEnumerable<Account> accounts)
+        {
+            if (accounts == null)
+                return new List<Account>();
+
+            List<Account> resolved = new List<Account>();
+
+            foreach (Account account in accounts)
+            {
+                Account mapped = ResolveAccountReference(account);
+                if (mapped != null)
+                    resolved.Add(mapped);
+            }
+
+            return DistinctAccounts(resolved);
+        }
+
         private List<Account> GetLaunchTargetsSnapshot()
         {
+            if (SelectedAccounts != null && SelectedAccounts.Count > 1)
+            {
+                List<Account> stickyMulti = ResolveAccountsToList(SelectedAccounts);
+                if (stickyMulti.Count > 1)
+                    return stickyMulti;
+            }
+
             List<Account> selectedNow = GetSelectedAccountsFromView();
-            if (selectedNow.Count > 0)
-                return selectedNow;
+            List<Account> resolvedNow = ResolveAccountsToList(selectedNow);
+            if (resolvedNow.Count > 0)
+                return resolvedNow;
 
             if (SelectedAccounts != null && SelectedAccounts.Count > 0)
-                return DistinctAccounts(SelectedAccounts.Where(account => account != null && AccountsList.Contains(account)));
+                return ResolveAccountsToList(SelectedAccounts);
 
             if (SelectedAccount != null)
-                return new List<Account> { SelectedAccount };
+                return ResolveAccountsToList(new List<Account> { SelectedAccount });
 
             return new List<Account>();
         }
@@ -3183,7 +3235,15 @@ namespace RBX_Alt_Manager
         private void AccountsView_SelectedIndexChanged(object sender, EventArgs e)
         {
             List<Account> selectedNow = GetSelectedAccountsFromView();
-            SelectedAccounts = selectedNow;
+            bool DowngradeFromMultiOnFocusLoss =
+                !AccountsView.Focused
+                && SelectedAccounts != null
+                && SelectedAccounts.Count > 1
+                && selectedNow.Count <= 1;
+
+            if (!DowngradeFromMultiOnFocusLoss)
+                SelectedAccounts = selectedNow;
+
             UpdateSelectionStatusText();
 
             if (selectedNow.Count != 1)
@@ -3863,8 +3923,7 @@ namespace RBX_Alt_Manager
             bool AsyncJoin = General.Get<bool>("AsyncJoin");
             CancellationTokenSource Token = LauncherToken;
             List<string> Failures = new List<string>();
-            List<Account> LaunchQueue = DistinctAccounts((Accounts ?? new List<Account>())
-                .Where(account => account != null && AccountsList.Contains(account)));
+            List<Account> LaunchQueue = ResolveAccountsToList(Accounts ?? new List<Account>());
             bool MultiLaunch = LaunchQueue.Count > 1;
 
             if (MultiLaunch)
