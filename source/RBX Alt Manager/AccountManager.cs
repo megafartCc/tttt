@@ -82,10 +82,9 @@ namespace RBX_Alt_Manager
         public static IniSection Prompts;
 
         private static Mutex rbxMultiMutex;
+        private static Mutex rbxMultiEventNameMutex;
         private readonly static object saveLock = new object();
         private readonly static object rgSaveLock = new object();
-        private readonly static object browserTrackerLock = new object();
-        private readonly static Random browserTrackerRandom = new Random();
         public event EventHandler<GameArgs> RecentGameAdded;
 
         private bool IsResettingPassword;
@@ -95,11 +94,15 @@ namespace RBX_Alt_Manager
         private System.Timers.Timer PresenceTimer;
         private System.Timers.Timer LiveStatusTimer;
         private System.Timers.Timer LastSeenTimer;
+        private System.Timers.Timer ProcessOptimizerTimer;
         private readonly static Regex BrowserTrackerRegex = new Regex(@"(?:\-b\s+|browsertrackerid[:=])(\d+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
         private readonly static Regex MultiRbxHandleRegex = new Regex(@"^\s*([0-9A-F]+):\s+\w+\s+.+\\(ROBLOX_singletonMutex|ROBLOX_singletonEvent)\b", RegexOptions.IgnoreCase | RegexOptions.Multiline | RegexOptions.Compiled);
         private int PresenceUpdateInProgress;
         private int LiveStatusUpdateInProgress;
+        private int ProcessOptimizerInProgress;
+        private int BulkLaunchInProgress;
         private DateTime LastOpenInstancePresenceUpdate = DateTime.MinValue;
+        private OLVColumn CurrentPidColumn;
         private OLVColumn CurrentGameColumn;
         private OLVColumn LastSeenColumn;
         private readonly ConcurrentDictionary<long, string> PlaceNameCache = new ConcurrentDictionary<long, string>();
@@ -109,10 +112,12 @@ namespace RBX_Alt_Manager
         private const long AutoRejoinPlaceId = 109983668079237;
         private static readonly TimeSpan AutoRejoinOfflineThreshold = TimeSpan.FromSeconds(105);
         private static readonly TimeSpan AutoRejoinRetryCooldown = TimeSpan.FromSeconds(30);
-        private static readonly TimeSpan AutoRejoinStartupGrace = TimeSpan.FromSeconds(45);
         private readonly ConcurrentDictionary<long, AutoRejoinState> AutoRejoinStates = new ConcurrentDictionary<long, AutoRejoinState>();
         private readonly ConcurrentDictionary<long, byte> AutoRejoinInProgress = new ConcurrentDictionary<long, byte>();
-        private readonly DateTime AutoRejoinStartedUtc = DateTime.UtcNow;
+        private readonly ConcurrentDictionary<string, ServerClaimState> ScriptServerClaims = new ConcurrentDictionary<string, ServerClaimState>();
+        private readonly object ScriptServerClaimsLock = new object();
+        private static readonly TimeSpan ScriptServerClaimMinLease = TimeSpan.FromSeconds(10);
+        private static readonly TimeSpan ScriptServerClaimMaxLease = TimeSpan.FromMinutes(30);
 
         private sealed class ScriptLiveStatusOverride
         {
@@ -123,6 +128,12 @@ namespace RBX_Alt_Manager
             public string GameName { get; set; }
         }
 
+        private sealed class OpenInstanceState
+        {
+            public bool? IsConnectedToServer { get; set; }
+            public int ProcessId { get; set; }
+        }
+
         private sealed class AutoRejoinState
         {
             public bool HasSeenActiveSession { get; set; }
@@ -130,10 +141,22 @@ namespace RBX_Alt_Manager
             public DateTime LastAttemptUtc { get; set; } = DateTime.MinValue;
         }
 
+        private sealed class ServerClaimState
+        {
+            public string Owner { get; set; }
+            public DateTime ExpiresAtUtc { get; set; }
+        }
+
         private static readonly byte[] Entropy = new byte[] { 0x52, 0x4f, 0x42, 0x4c, 0x4f, 0x58, 0x20, 0x41, 0x43, 0x43, 0x4f, 0x55, 0x4e, 0x54, 0x20, 0x4d, 0x41, 0x4e, 0x41, 0x47, 0x45, 0x52, 0x20, 0x7c, 0x20, 0x3a, 0x29, 0x20, 0x7c, 0x20, 0x42, 0x52, 0x4f, 0x55, 0x47, 0x48, 0x54, 0x20, 0x54, 0x4f, 0x20, 0x59, 0x4f, 0x55, 0x20, 0x42, 0x55, 0x59, 0x20, 0x69, 0x63, 0x33, 0x77, 0x30, 0x6c, 0x66 };
 
         [DllImport("DwmApi")]
         private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, int[] attrValue, int attrSize);
+        [DllImport("psapi.dll", SetLastError = true)]
+        private static extern bool EmptyWorkingSet(IntPtr hProcess);
+        [DllImport("ntdll.dll")]
+        private static extern int NtSetInformationProcess(IntPtr processHandle, int processInformationClass, ref int processInformation, int processInformationLength);
+
+        private const int ProcessIoPriorityClass = 33;
 
         public static void SetDarkBar(IntPtr Handle)
         {
@@ -186,6 +209,14 @@ namespace RBX_Alt_Manager
             if (!General.Exists("PresenceUpdateRate")) General.Set("PresenceUpdateRate", "5");
             if (!General.Exists("EnableLiveStatusPush")) General.Set("EnableLiveStatusPush", "true");
             if (!General.Exists("AutoRejoin")) General.Set("AutoRejoin", "false");
+            if (!General.Exists("EnableProcessOptimizer")) General.Set("EnableProcessOptimizer", "false");
+            if (!General.Exists("RobloxPriority")) General.Set("RobloxPriority", "BelowNormal");
+            if (!General.Exists("RobloxIoPriority")) General.Set("RobloxIoPriority", "Low");
+            if (!General.Exists("RobloxAffinityMask")) General.Set("RobloxAffinityMask", "");
+            if (!General.Exists("RaiseManagerPriority")) General.Set("RaiseManagerPriority", "true");
+            if (!General.Exists("ManagerPriority")) General.Set("ManagerPriority", "AboveNormal");
+            if (!General.Exists("ProcessLassoPath")) General.Set("ProcessLassoPath", @"C:\Program Files\Process Lasso\ProcessLasso.exe");
+            if (!General.Exists("RAMMapPath")) General.Set("RAMMapPath", @"C:\Sysinternals\RAMMap.exe");
             if (!General.Exists("UnlockFPS")) General.Set("UnlockFPS", "false");
             if (!General.Exists("MaxFPSValue")) General.Set("MaxFPSValue", "120");
             if (!General.Exists("UseCefSharpBrowser")) General.Set("UseCefSharpBrowser", "false");
@@ -209,6 +240,7 @@ namespace RBX_Alt_Manager
 
             InitializeComponent();
             this.Rescale();
+            SetupAccountPidColumn();
             SetupAccountGameColumn();
             SetupAccountLastSeenColumn();
 
@@ -216,6 +248,8 @@ namespace RBX_Alt_Manager
             SelectedAccounts = new List<Account>();
 
             AccountsView.SetObjects(AccountsList);
+            UpdateSelectionStatusText();
+            SelectionStatusLabel?.BringToFront();
 
             if (ThemeEditor.UseDarkTopBar) Icon = Properties.Resources.team_KX4_icon_white; // this has to go after or icon wont actually change
 
@@ -266,6 +300,33 @@ namespace RBX_Alt_Manager
                 });
         }
 
+        private static string GetPidText(Account account)
+        {
+            if (account == null || account.CurrentProcessId <= 0)
+                return string.Empty;
+
+            return account.CurrentProcessId.ToString(CultureInfo.InvariantCulture);
+        }
+
+        private void SetupAccountPidColumn()
+        {
+            if (AccountsView.AllColumns.Any(column => string.Equals(column.Text, "PID", StringComparison.OrdinalIgnoreCase)))
+                return;
+
+            CurrentPidColumn = new OLVColumn("PID", "CurrentProcessId")
+            {
+                IsEditable = false,
+                Sortable = false,
+                Width = (int)(68 * Program.Scale),
+                TextAlign = HorizontalAlignment.Center
+            };
+
+            CurrentPidColumn.AspectGetter = rowObject => rowObject is Account account ? GetPidText(account) : string.Empty;
+
+            AccountsView.AllColumns.Insert(1, CurrentPidColumn);
+            AccountsView.Columns.Insert(1, CurrentPidColumn);
+        }
+
         private void SetupAccountGameColumn()
         {
             if (AccountsView.AllColumns.Any(column => column.AspectName == "CurrentGameName"))
@@ -280,8 +341,10 @@ namespace RBX_Alt_Manager
 
             CurrentGameColumn.AspectGetter = rowObject => rowObject is Account account ? account.CurrentGameName : string.Empty;
 
-            AccountsView.AllColumns.Insert(1, CurrentGameColumn);
-            AccountsView.Columns.Insert(1, CurrentGameColumn);
+            int InsertIndex = AccountsView.AllColumns.Any(column => string.Equals(column.Text, "PID", StringComparison.OrdinalIgnoreCase)) ? 2 : 1;
+
+            AccountsView.AllColumns.Insert(InsertIndex, CurrentGameColumn);
+            AccountsView.Columns.Insert(InsertIndex, CurrentGameColumn);
         }
 
         private static string FormatLastSeenAge(DateTime LastSeenUtc)
@@ -309,7 +372,17 @@ namespace RBX_Alt_Manager
         {
             if (account == null) return string.Empty;
             if (account.LastLiveStatusUpdateUtc == DateTime.MinValue)
+            {
+                if (General != null
+                    && General.Get<bool>("AutoRejoin")
+                    && AutoRejoinStates.TryGetValue(account.UserID, out AutoRejoinState state)
+                    && state?.OfflineSinceUtc.HasValue == true)
+                {
+                    return $"No signal ({FormatLastSeenAge(state.OfflineSinceUtc.Value)})";
+                }
+
                 return "No signal";
+            }
 
             return FormatLastSeenAge(account.LastLiveStatusUpdateUtc);
         }
@@ -328,8 +401,12 @@ namespace RBX_Alt_Manager
 
             LastSeenColumn.AspectGetter = rowObject => rowObject is Account account ? GetLastSeenText(account) : string.Empty;
 
-            AccountsView.AllColumns.Insert(2, LastSeenColumn);
-            AccountsView.Columns.Insert(2, LastSeenColumn);
+            int InsertIndex = CurrentGameColumn != null ? AccountsView.AllColumns.IndexOf(CurrentGameColumn) + 1 : 2;
+            if (InsertIndex < 0)
+                InsertIndex = 2;
+
+            AccountsView.AllColumns.Insert(InsertIndex, LastSeenColumn);
+            AccountsView.Columns.Insert(InsertIndex, LastSeenColumn);
         }
 
         private void Sink_CanDrop(object sender, OlvDropEventArgs e)
@@ -391,6 +468,147 @@ namespace RBX_Alt_Manager
             }
         }
 
+        private static string GetAccountDistinctKey(Account account)
+        {
+            if (account == null)
+                return string.Empty;
+
+            if (account.UserID > 0)
+                return $"id:{account.UserID}";
+
+            return $"name:{(account.Username ?? string.Empty).Trim().ToLowerInvariant()}";
+        }
+
+        private static string GenerateBrowserTrackerId()
+        {
+            int PartA;
+            int PartB;
+
+            using (RandomNumberGenerator rng = RandomNumberGenerator.Create())
+            {
+                byte[] bytes = new byte[8];
+                rng.GetBytes(bytes);
+                PartA = 100000 + (Math.Abs(BitConverter.ToInt32(bytes, 0)) % 75000);
+                PartB = 100000 + (Math.Abs(BitConverter.ToInt32(bytes, 4)) % 800000);
+            }
+
+            return $"{PartA}{PartB}";
+        }
+
+        private void NormalizeBrowserTrackerIds()
+        {
+            if (AccountsList == null || AccountsList.Count == 0)
+                return;
+
+            HashSet<string> Assigned = new HashSet<string>(StringComparer.Ordinal);
+            bool Changed = false;
+
+            foreach (Account account in AccountsList)
+            {
+                if (account == null)
+                    continue;
+
+                string Current = (account.BrowserTrackerID ?? string.Empty).Trim();
+
+                if (!string.IsNullOrWhiteSpace(Current) && Assigned.Add(Current))
+                    continue;
+
+                string NewId;
+                do { NewId = GenerateBrowserTrackerId(); }
+                while (!Assigned.Add(NewId));
+
+                if (!string.Equals(Current, NewId, StringComparison.Ordinal))
+                {
+                    Program.Logger.Info($"[BulkLaunch] Assigned new BrowserTrackerID for {account.Username}: {NewId}");
+                    account.BrowserTrackerID = NewId;
+                    Changed = true;
+                }
+            }
+
+            if (Changed)
+                SaveAccounts(BypassRateLimit: true, BypassCountCheck: true);
+        }
+
+        private static List<Account> DistinctAccounts(IEnumerable<Account> accounts)
+        {
+            if (accounts == null)
+                return new List<Account>();
+
+            HashSet<string> seen = new HashSet<string>(StringComparer.Ordinal);
+            List<Account> result = new List<Account>();
+
+            foreach (Account account in accounts)
+            {
+                if (account == null)
+                    continue;
+
+                string key = GetAccountDistinctKey(account);
+                if (string.IsNullOrWhiteSpace(key))
+                    continue;
+
+                if (seen.Add(key))
+                    result.Add(account);
+            }
+
+            return result;
+        }
+
+        private List<Account> GetSelectedAccountsFromView()
+        {
+            List<Account> byObjects = new List<Account>();
+            List<Account> byIndices = new List<Account>();
+
+            try { byObjects = DistinctAccounts(AccountsView.SelectedObjects.Cast<Account>()); } catch { }
+
+            try
+            {
+                foreach (int selectedIndex in AccountsView.SelectedIndices)
+                {
+                    if (AccountsView.GetModelObject(selectedIndex) is Account account)
+                        byIndices.Add(account);
+                }
+
+                byIndices = DistinctAccounts(byIndices);
+            }
+            catch { }
+
+            if (byIndices.Count > byObjects.Count)
+                return byIndices;
+
+            return byObjects;
+        }
+
+        private List<Account> GetLaunchTargetsSnapshot()
+        {
+            List<Account> selectedNow = GetSelectedAccountsFromView();
+            if (selectedNow.Count > 0)
+                return selectedNow;
+
+            if (SelectedAccounts != null && SelectedAccounts.Count > 0)
+                return DistinctAccounts(SelectedAccounts.Where(account => account != null && AccountsList.Contains(account)));
+
+            if (SelectedAccount != null)
+                return new List<Account> { SelectedAccount };
+
+            return new List<Account>();
+        }
+
+        private void UpdateSelectionStatusText()
+        {
+            if (SelectionStatusLabel == null || SelectionStatusLabel.IsDisposed)
+                return;
+
+            int selectedCount = 0;
+
+            try { selectedCount = GetSelectedAccountsFromView().Count; } catch { }
+
+            if (selectedCount == 0 && SelectedAccounts != null)
+                selectedCount = SelectedAccounts.Count;
+
+            int totalCount = AccountsList?.Count ?? 0;
+            SelectionStatusLabel.Text = $"Selected: {selectedCount}/{totalCount}";
+        }
+
         private void RefreshView(object obj = null)
         {
             AccountsView.InvokeIfRequired(() =>
@@ -403,6 +621,8 @@ namespace RBX_Alt_Manager
                     AccountsView.RefreshObject(obj);
                     AccountsView.EnsureModelVisible(obj);
                 }
+
+                UpdateSelectionStatusText();
             });
         }
 
@@ -917,8 +1137,12 @@ namespace RBX_Alt_Manager
             LastSeenTimer = new System.Timers.Timer(1000) { AutoReset = true, Enabled = true };
             LastSeenTimer.Elapsed += (s, e) => RefreshLastSeenColumn();
 
+            ProcessOptimizerTimer = new System.Timers.Timer(2000) { AutoReset = true, Enabled = true };
+            ProcessOptimizerTimer.Elapsed += (s, e) => TryApplyProcessOptimization();
+
             _ = TryUpdateLiveStatus(true);
             _ = TryUpdatePresence();
+            TryApplyProcessOptimization();
         }
 
         public void ApplyTheme()
@@ -1119,9 +1343,7 @@ namespace RBX_Alt_Manager
         private static bool IsAccountInGame(Account account)
         {
             if (account == null) return false;
-
-            if (!HasFreshLiveSignal(account))
-                return false;
+            if (!HasFreshLiveSignal(account)) return false;
 
             bool ScriptInGame = account.HasOpenInstance && account.IsOnServer && HasResolvedGame(account);
             bool PresenceInGame = account.Presence?.userPresenceType == UserPresenceType.InGame && GetPresencePlaceId(account).HasValue;
@@ -1129,33 +1351,73 @@ namespace RBX_Alt_Manager
             return ScriptInGame || PresenceInGame;
         }
 
-        private async Task CloseAccountProcessForAutoRejoin(Account account)
+        private async Task<bool> TryCloseAutoRejoinProcess(Process process)
         {
-            if (account == null || string.IsNullOrEmpty(account.BrowserTrackerID)) return;
+            if (process == null)
+                return false;
 
             try
             {
-                foreach (Process proc in Process.GetProcessesByName("RobloxPlayerBeta"))
+                if (process.HasExited)
+                    return true;
+
+                process.CloseMainWindow();
+                await Task.Delay(250);
+                process.CloseMainWindow();
+                await Task.Delay(250);
+
+                if (!process.HasExited)
+                    process.Kill();
+
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private async Task CloseAccountProcessForAutoRejoin(Account account)
+        {
+            if (account == null) return;
+
+            bool ClosedAny = false;
+
+            try
+            {
+                if (account.CurrentProcessId > 0)
                 {
                     try
                     {
-                        string commandLine = proc.GetCommandLine() ?? string.Empty;
-                        Match TrackerMatch = BrowserTrackerRegex.Match(commandLine);
-                        string TrackerID = TrackerMatch.Success ? TrackerMatch.Groups[1].Value : string.Empty;
-
-                        if (!string.Equals(TrackerID, account.BrowserTrackerID, StringComparison.Ordinal))
-                            continue;
-
-                        proc.CloseMainWindow();
-                        await Task.Delay(250);
-                        proc.CloseMainWindow();
-                        await Task.Delay(250);
-
-                        if (!proc.HasExited)
-                            proc.Kill();
+                        using (Process pidProcess = Process.GetProcessById(account.CurrentProcessId))
+                            ClosedAny = await TryCloseAutoRejoinProcess(pidProcess) || ClosedAny;
                     }
                     catch { }
                 }
+
+                if (!ClosedAny && !string.IsNullOrEmpty(account.BrowserTrackerID))
+                {
+                    foreach (Process proc in Process.GetProcessesByName("RobloxPlayerBeta"))
+                    {
+                        try
+                        {
+                            string commandLine = proc.GetCommandLine() ?? string.Empty;
+                            Match TrackerMatch = BrowserTrackerRegex.Match(commandLine);
+                            string TrackerID = TrackerMatch.Success ? TrackerMatch.Groups[1].Value : string.Empty;
+
+                            if (!string.Equals(TrackerID, account.BrowserTrackerID, StringComparison.Ordinal))
+                                continue;
+
+                            if (await TryCloseAutoRejoinProcess(proc))
+                                ClosedAny = true;
+                        }
+                        catch { }
+                        finally { proc.Dispose(); }
+                    }
+                }
+
+                if (ClosedAny)
+                    account.CurrentProcessId = 0;
             }
             catch (Exception x)
             {
@@ -1176,8 +1438,8 @@ namespace RBX_Alt_Manager
                 if (General.Get<bool>("EnableMultiRbx"))
                     UpdateMultiRoblox();
 
-                string Result = await account.JoinServer(AutoRejoinPlaceId, "", false, false, true);
-                if (!string.Equals(Result, "Success", StringComparison.OrdinalIgnoreCase))
+                string Result = await JoinWithFailureRecovery(account, AutoRejoinPlaceId, "", false, false, "AutoRejoin");
+                if (!IsJoinSuccess(Result))
                     Program.Logger.Warn($"[AutoRejoin] Relaunch failed for {account.Username}: {Result}");
             }
             catch (Exception x)
@@ -1200,9 +1462,10 @@ namespace RBX_Alt_Manager
                 return;
             }
 
-            DateTime NowUtc = DateTime.UtcNow;
-            if ((NowUtc - AutoRejoinStartedUtc) < AutoRejoinStartupGrace)
+            if (Interlocked.CompareExchange(ref BulkLaunchInProgress, 0, 0) == 1)
                 return;
+
+            DateTime NowUtc = DateTime.UtcNow;
 
             HashSet<long> ExistingAccounts = new HashSet<long>();
 
@@ -1216,6 +1479,7 @@ namespace RBX_Alt_Manager
                 bool InGame = IsAccountInGame(account);
                 DateTime? LastSignalUtc = account.LastLiveStatusUpdateUtc != DateTime.MinValue ? account.LastLiveStatusUpdateUtc : (DateTime?)null;
                 bool ManagedAccount = !string.IsNullOrEmpty(account.BrowserTrackerID);
+                bool HasKnownProcess = account.CurrentProcessId > 0;
                 TimeSpan SignalAge = TimeSpan.MaxValue;
                 if (LastSignalUtc.HasValue)
                 {
@@ -1228,8 +1492,8 @@ namespace RBX_Alt_Manager
                 bool SignalStale = LastSignalUtc.HasValue && !HasFreshSignal;
                 bool MissingSignal = !LastSignalUtc.HasValue;
 
-                if (account.HasOpenInstance || InGame || LastSignalUtc.HasValue || ManagedAccount)
-                    State.HasSeenActiveSession = true;
+                // Auto Rejoin applies to all listed accounts when enabled, even if no signal was seen yet.
+                State.HasSeenActiveSession = true;
 
                 // Any fresh signal means the instance is alive; do not run rejoin timer.
                 if (HasFreshSignal)
@@ -1238,11 +1502,8 @@ namespace RBX_Alt_Manager
                     continue;
                 }
 
-                // Start offline timer from the last signal timestamp (or now if there is none).
                 if (!State.OfflineSinceUtc.HasValue)
-                {
                     State.OfflineSinceUtc = LastSignalUtc.HasValue && LastSignalUtc.Value <= NowUtc ? LastSignalUtc.Value : NowUtc;
-                }
 
                 if ((NowUtc - State.OfflineSinceUtc.Value) < AutoRejoinOfflineThreshold)
                     continue;
@@ -1266,6 +1527,73 @@ namespace RBX_Alt_Manager
 
                 AutoRejoinStates.TryRemove(UserId, out _);
                 AutoRejoinInProgress.TryRemove(UserId, out _);
+            }
+        }
+
+        private static string BuildScriptServerClaimKey(long PlaceId, string JobId)
+        {
+            string NormalizedJobId = (JobId ?? string.Empty).Trim().ToLowerInvariant();
+            if (PlaceId <= 0 || string.IsNullOrEmpty(NormalizedJobId))
+                return string.Empty;
+
+            return $"{PlaceId}:{NormalizedJobId}";
+        }
+
+        private static TimeSpan ClampScriptServerLease(int LeaseSeconds)
+        {
+            if (LeaseSeconds <= 0)
+                return ScriptServerClaimMinLease;
+
+            TimeSpan Lease = TimeSpan.FromSeconds(LeaseSeconds);
+            if (Lease < ScriptServerClaimMinLease)
+                return ScriptServerClaimMinLease;
+            if (Lease > ScriptServerClaimMaxLease)
+                return ScriptServerClaimMaxLease;
+            return Lease;
+        }
+
+        private bool TryClaimScriptServer(long PlaceId, string JobId, string Owner, int LeaseSeconds, out DateTime ExpiresAtUtc, out string ExistingOwner)
+        {
+            ExpiresAtUtc = DateTime.MinValue;
+            ExistingOwner = string.Empty;
+
+            string Key = BuildScriptServerClaimKey(PlaceId, JobId);
+            if (string.IsNullOrEmpty(Key))
+                return false;
+
+            string NormalizedOwner = string.IsNullOrWhiteSpace(Owner) ? "unknown" : Owner.Trim();
+            DateTime NowUtc = DateTime.UtcNow;
+            DateTime NewExpiryUtc = NowUtc.Add(ClampScriptServerLease(LeaseSeconds));
+
+            lock (ScriptServerClaimsLock)
+            {
+                foreach (KeyValuePair<string, ServerClaimState> Pair in ScriptServerClaims.ToArray())
+                {
+                    if (Pair.Value == null || Pair.Value.ExpiresAtUtc <= NowUtc)
+                        ScriptServerClaims.TryRemove(Pair.Key, out _);
+                }
+
+                if (ScriptServerClaims.TryGetValue(Key, out ServerClaimState Existing)
+                    && Existing != null
+                    && Existing.ExpiresAtUtc > NowUtc)
+                {
+                    if (!string.Equals(Existing.Owner, NormalizedOwner, StringComparison.OrdinalIgnoreCase))
+                    {
+                        ExpiresAtUtc = Existing.ExpiresAtUtc;
+                        ExistingOwner = Existing.Owner;
+                        return false;
+                    }
+                }
+
+                ScriptServerClaims[Key] = new ServerClaimState
+                {
+                    Owner = NormalizedOwner,
+                    ExpiresAtUtc = NewExpiryUtc
+                };
+
+                ExpiresAtUtc = NewExpiryUtc;
+                ExistingOwner = NormalizedOwner;
+                return true;
             }
         }
 
@@ -1297,7 +1625,7 @@ namespace RBX_Alt_Manager
 
             if ((Method == "GetCookie" || Method == "GetAccounts" || Method == "LaunchAccount" || Method == "FollowUser") && ((WSPassword != null && WSPassword.Length < 6) || (Password != null && Password != WSPassword))) return Reply("Invalid Password, make sure your password contains 6 or more characters", false, 401, "Invalid Password");
 
-            if (!Developer.Get<bool>("EnableWebServer") && Method != "PushLiveStatus")
+            if (!Developer.Get<bool>("EnableWebServer") && Method != "PushLiveStatus" && Method != "ClaimServer")
                 return Reply("Method not allowed", false, 401, "Method not allowed");
 
             if (Method == "GetAccounts")
@@ -1434,6 +1762,58 @@ namespace RBX_Alt_Manager
                 return Reply("true", true, Raw: "true");
             }
 
+            if (Method == "ClaimServer")
+            {
+                JObject Payload = null;
+                if (!string.IsNullOrWhiteSpace(Body))
+                    Body.TryParseJson(out Payload);
+
+                string PlaceIdValue = request.QueryString["PlaceId"]
+                    ?? request.QueryString["placeid"]
+                    ?? Payload?["PlaceId"]?.ToString()
+                    ?? Payload?["placeId"]?.ToString();
+
+                string JobId = request.QueryString["JobId"]
+                    ?? request.QueryString["jobid"]
+                    ?? Payload?["JobId"]?.ToString()
+                    ?? Payload?["jobId"]?.ToString();
+
+                string Owner = request.QueryString["Owner"]
+                    ?? request.QueryString["Account"]
+                    ?? request.QueryString["Username"]
+                    ?? request.QueryString["UserId"]
+                    ?? Payload?["Owner"]?.ToString()
+                    ?? Payload?["Account"]?.ToString()
+                    ?? Payload?["Username"]?.ToString()
+                    ?? Payload?["UserId"]?.ToString()
+                    ?? Payload?["userid"]?.ToString();
+
+                string LeaseSecondsValue = request.QueryString["LeaseSeconds"]
+                    ?? request.QueryString["leaseSeconds"]
+                    ?? Payload?["LeaseSeconds"]?.ToString()
+                    ?? Payload?["leaseSeconds"]?.ToString();
+
+                if (!long.TryParse(PlaceIdValue, out long PlaceId) || PlaceId <= 0 || string.IsNullOrWhiteSpace(JobId))
+                    return Reply(JsonConvert.SerializeObject(new { ok = false, claimed = false, error = "invalid_place_or_job" }), true);
+
+                int LeaseSeconds = 120;
+                if (int.TryParse(LeaseSecondsValue, out int ParsedLease) && ParsedLease > 0)
+                    LeaseSeconds = ParsedLease;
+
+                bool Claimed = TryClaimScriptServer(PlaceId, JobId, Owner, LeaseSeconds, out DateTime ExpiresAtUtc, out string ExistingOwner);
+                string Response = JsonConvert.SerializeObject(new
+                {
+                    ok = true,
+                    claimed = Claimed,
+                    placeId = PlaceId,
+                    jobId = JobId,
+                    owner = ExistingOwner,
+                    expiresAtUtc = ExpiresAtUtc == DateTime.MinValue ? string.Empty : ExpiresAtUtc.ToString("o"),
+                });
+
+                return Reply(Response, true);
+            }
+
             if (string.IsNullOrEmpty(Account)) return Reply("Empty Account", false);
 
             Account account = AccountsList.FirstOrDefault(x => x.Username == Account || x.UserID.ToString() == Account);
@@ -1457,7 +1837,12 @@ namespace RBX_Alt_Manager
                 string FollowUser = request.QueryString["FollowUser"];
                 string JoinVIP = request.QueryString["JoinVIP"];
 
-                account.JoinServer(PlaceId, JobID, FollowUser == "true", JoinVIP == "true");
+                _ = Task.Run(async () =>
+                {
+                    string res = await JoinWithFailureRecovery(account, PlaceId, JobID, FollowUser == "true", JoinVIP == "true", "WebLaunchAccount");
+                    if (!IsJoinSuccess(res))
+                        Program.Logger.Warn($"[WebLaunchAccount] Launch failed for {account.Username}: {res}");
+                });
 
                 return Reply($"Launched {Account} to {PlaceId}", true);
             }
@@ -1471,7 +1856,12 @@ namespace RBX_Alt_Manager
                 if (!GetUserID(User, out long UserId, out var Response))
                     return Reply($"[{Response.StatusCode} {Response.StatusDescription}] Failed to get UserId: {Response.Content}", false);
 
-                account.JoinServer(UserId, "", true);
+                _ = Task.Run(async () =>
+                {
+                    string res = await JoinWithFailureRecovery(account, UserId, "", true, false, "WebFollowUser");
+                    if (!IsJoinSuccess(res))
+                        Program.Logger.Warn($"[WebFollowUser] Follow failed for {account.Username}: {res}");
+                });
 
                 return Reply($"Joining {User}'s game on {Account}", true);
             }
@@ -1601,8 +1991,17 @@ namespace RBX_Alt_Manager
 
         private void AccountManager_Shown(object sender, EventArgs e)
         {
-            if (!UpdateMultiRoblox() && !General.Get<bool>("HideRbxAlert"))
-                MessageBox.Show("WARNING: Multi Roblox could not lock Roblox's singleton right now.\nRAM will retry automatically for bulk launch.\nIf it still fails, run RAM as admin once and retry.", "Roblox Account Manager", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            _ = Task.Run(() =>
+            {
+                bool multiOk = UpdateMultiRoblox();
+                if (!multiOk && !General.Get<bool>("HideRbxAlert"))
+                {
+                    this.InvokeIfRequired(() =>
+                    {
+                        MessageBox.Show("WARNING: Multi Roblox could not lock Roblox's singleton right now.\nRAM will retry automatically for bulk launch.\nIf it still fails, run RAM as admin once and retry.", "Roblox Account Manager", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    });
+                }
+            });
 
             if (General.Get<bool>("CheckForUpdates"))
             {
@@ -1734,9 +2133,6 @@ namespace RBX_Alt_Manager
 
             if (Enabled)
             {
-                if (rbxMultiMutex != null)
-                    return true;
-
                 if (TryAcquireMultiRobloxMutex())
                     return true;
 
@@ -1751,12 +2147,10 @@ namespace RBX_Alt_Manager
                 return false;
             }
 
-            if (!Enabled && rbxMultiMutex != null)
+            if (!Enabled)
             {
-                try { rbxMultiMutex.ReleaseMutex(); } catch { }
-                try { rbxMultiMutex.Close(); } catch { }
-                try { rbxMultiMutex.Dispose(); } catch { }
-                rbxMultiMutex = null;
+                ReleaseMultiRobloxMutex(ref rbxMultiMutex);
+                ReleaseMultiRobloxMutex(ref rbxMultiEventNameMutex);
             }
 
             return true;
@@ -1764,19 +2158,37 @@ namespace RBX_Alt_Manager
 
         private bool TryAcquireMultiRobloxMutex()
         {
-            if (rbxMultiMutex != null)
+            bool mutexNameOk = TryAcquireNamedMutex("ROBLOX_singletonMutex", ref rbxMultiMutex);
+            bool eventNameOk = TryAcquireNamedMutex("ROBLOX_singletonEvent", ref rbxMultiEventNameMutex);
+            return mutexNameOk || eventNameOk;
+        }
+
+        private static void ReleaseMultiRobloxMutex(ref Mutex mutex)
+        {
+            if (mutex == null)
+                return;
+
+            try { mutex.ReleaseMutex(); } catch { }
+            try { mutex.Close(); } catch { }
+            try { mutex.Dispose(); } catch { }
+            mutex = null;
+        }
+
+        private bool TryAcquireNamedMutex(string mutexName, ref Mutex mutex)
+        {
+            if (mutex != null)
                 return true;
 
             try
             {
-                rbxMultiMutex = new Mutex(true, "ROBLOX_singletonMutex");
+                mutex = new Mutex(true, mutexName);
 
                 try
                 {
-                    if (!rbxMultiMutex.WaitOne(TimeSpan.Zero, true))
+                    if (!mutex.WaitOne(TimeSpan.Zero, true))
                     {
-                        rbxMultiMutex.Dispose();
-                        rbxMultiMutex = null;
+                        mutex.Dispose();
+                        mutex = null;
                         return false;
                     }
                 }
@@ -1789,10 +2201,10 @@ namespace RBX_Alt_Manager
             }
             catch (Exception x)
             {
-                Program.Logger.Warn($"[MultiRbx] Failed acquiring ROBLOX_singletonMutex: {x.Message}");
+                Program.Logger.Warn($"[MultiRbx] Failed acquiring {mutexName}: {x.Message}");
 
-                try { rbxMultiMutex?.Dispose(); } catch { }
-                rbxMultiMutex = null;
+                try { mutex?.Dispose(); } catch { }
+                mutex = null;
                 return false;
             }
         }
@@ -1840,15 +2252,44 @@ namespace RBX_Alt_Manager
             return RobloxWatcher.IsHandleEulaAccepted();
         }
 
+        private IEnumerable<Process> GetMultiRobloxHandleCandidates()
+        {
+            List<Process> candidates = new List<Process>();
+
+            try
+            {
+                foreach (Process process in Process.GetProcesses())
+                {
+                    try
+                    {
+                        string processName = process.ProcessName ?? string.Empty;
+                        if (processName.IndexOf("Roblox", StringComparison.OrdinalIgnoreCase) < 0)
+                        {
+                            process.Dispose();
+                            continue;
+                        }
+
+                        candidates.Add(process);
+                    }
+                    catch
+                    {
+                        try { process.Dispose(); } catch { }
+                    }
+                }
+            }
+            catch { }
+
+            return candidates;
+        }
+
         private bool TryReleaseRobloxSingletonHandles()
         {
             if (!EnsureHandleToolReady())
                 return false;
 
             bool ClosedAny = false;
-            Process[] RobloxProcesses = Process.GetProcessesByName("RobloxPlayerBeta");
 
-            foreach (Process process in RobloxProcesses)
+            foreach (Process process in GetMultiRobloxHandleCandidates())
             {
                 int pid = -1;
 
@@ -1944,8 +2385,351 @@ namespace RBX_Alt_Manager
             if (UpdateMultiRoblox())
                 return true;
 
-            MessageBox.Show("Failed to enable Multi Roblox for bulk launching.\nTry toggling Multi Roblox in settings, then launch again.\nIf it still fails, run RAM as admin once and retry.", "Roblox Account Manager", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Program.Logger.Warn("[BulkLaunch] Initial multi-Roblox prep failed. Forcing Roblox process reset and retrying prep.");
+            ForceStopAllRobloxProcessesForMultiPrep();
+            Thread.Sleep(700);
+
+            if (UpdateMultiRoblox())
+            {
+                Program.Logger.Info("[BulkLaunch] Multi-Roblox prep recovered after full Roblox reset.");
+                return true;
+            }
+
+            MessageBox.Show("Multi Roblox prep failed. RAM will still attempt bulk launch in best-effort mode.\nIf instances still do not open in parallel, close all Roblox processes and retry.", "Roblox Account Manager", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return false;
+        }
+
+        private void ForceStopAllRobloxProcessesForMultiPrep()
+        {
+            foreach (Process Process in GetAllRobloxClientProcessesForRecovery())
+            {
+                try
+                {
+                    if (Process.HasExited)
+                        continue;
+
+                    Process.CloseMainWindow();
+                    if (!Process.WaitForExit(700))
+                    {
+                        try { Process.Kill(); } catch { }
+                        try { Process.WaitForExit(1200); } catch { }
+                    }
+                }
+                catch { }
+                finally
+                {
+                    try { Process.Dispose(); } catch { }
+                }
+            }
+
+            try
+            {
+                RobloxWatcher.Instances.Clear();
+                RobloxWatcher.Seen.Clear();
+            }
+            catch { }
+        }
+
+        private bool PrepareMultiRobloxForAccountLaunch(int attempts = 3)
+        {
+            if (!General.Get<bool>("EnableMultiRbx"))
+                return true;
+
+            int retries = Math.Max(1, attempts);
+
+            for (int i = 0; i < retries; i++)
+            {
+                TryReleaseRobloxSingletonHandles();
+                if (UpdateMultiRoblox())
+                    return true;
+
+                Thread.Sleep(120);
+            }
+
+            return false;
+        }
+
+        private static bool IsJoinSuccess(string Result) =>
+            !string.IsNullOrWhiteSpace(Result) && Result.IndexOf("Success", StringComparison.OrdinalIgnoreCase) >= 0;
+
+        private static int GetRobloxPlayerProcessCount()
+        {
+            try { return Process.GetProcessesByName("RobloxPlayerBeta").Length; }
+            catch { return 0; }
+        }
+
+        private static bool IsProcessAlive(int processId)
+        {
+            if (processId <= 0)
+                return false;
+
+            try
+            {
+                using (Process process = Process.GetProcessById(processId))
+                    return !process.HasExited;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private int FindRobloxProcessIdByTracker(string browserTrackerId)
+        {
+            if (string.IsNullOrWhiteSpace(browserTrackerId))
+                return 0;
+
+            try
+            {
+                foreach (Process process in Process.GetProcessesByName("RobloxPlayerBeta"))
+                {
+                    try
+                    {
+                        if (process.HasExited)
+                            continue;
+
+                        string commandLine = process.GetCommandLine() ?? string.Empty;
+                        Match trackerMatch = BrowserTrackerRegex.Match(commandLine);
+                        string trackerId = trackerMatch.Success ? trackerMatch.Groups[1].Value : string.Empty;
+
+                        if (string.Equals(trackerId, browserTrackerId, StringComparison.Ordinal))
+                            return process.Id;
+                    }
+                    catch { }
+                    finally { try { process.Dispose(); } catch { } }
+                }
+            }
+            catch { }
+
+            return 0;
+        }
+
+        private async Task<bool> WaitForLaunchEvidence(Account account, int previousProcessId, int baselineProcessCount, int timeoutMs = 12000)
+        {
+            string trackerId = account?.BrowserTrackerID;
+            Stopwatch timer = Stopwatch.StartNew();
+
+            while (timer.ElapsedMilliseconds < timeoutMs)
+            {
+                int trackerProcessId = FindRobloxProcessIdByTracker(trackerId);
+                if (trackerProcessId > 0 && trackerProcessId != previousProcessId && IsProcessAlive(trackerProcessId))
+                    return true;
+
+                if (account != null)
+                {
+                    int pid = account.CurrentProcessId;
+                    if (pid > 0 && pid != previousProcessId && IsProcessAlive(pid))
+                        return true;
+                }
+
+                if (GetRobloxPlayerProcessCount() > baselineProcessCount)
+                    return true;
+
+                await Task.Delay(200);
+            }
+
+            return false;
+        }
+
+        private static IEnumerable<Process> GetAllRobloxClientProcessesForRecovery()
+        {
+            string[] Names = new[]
+            {
+                "RobloxPlayerBeta",
+                "RobloxPlayerLauncher",
+                "RobloxPlayerInstaller",
+                "RobloxCrashHandler",
+                "RobloxCrashHandler64",
+                "RobloxGameLauncher"
+            };
+
+            HashSet<int> SeenPids = new HashSet<int>();
+            List<Process> Result = new List<Process>();
+
+            foreach (string Name in Names)
+            {
+                Process[] Processes;
+                try { Processes = Process.GetProcessesByName(Name); }
+                catch { continue; }
+
+                foreach (Process Process in Processes)
+                {
+                    bool KeepProcess = false;
+
+                    try
+                    {
+                        KeepProcess = SeenPids.Add(Process.Id);
+                    }
+                    catch { }
+
+                    if (KeepProcess)
+                    {
+                        Result.Add(Process);
+                    }
+                    else
+                    {
+                        try { Process.Dispose(); } catch { }
+                    }
+                }
+            }
+
+            return Result;
+        }
+
+        private async Task CloseAllRobloxInstancesForRetry()
+        {
+            try
+            {
+                foreach (Process Process in GetAllRobloxClientProcessesForRecovery())
+                {
+                    try
+                    {
+                        if (Process.HasExited)
+                            continue;
+
+                        Process.CloseMainWindow();
+                        await Task.Delay(150);
+                        Process.CloseMainWindow();
+                        await Task.Delay(150);
+
+                        if (!Process.HasExited)
+                            Process.Kill();
+                    }
+                    catch { }
+                    finally
+                    {
+                        try { Process.Dispose(); } catch { }
+                    }
+                }
+            }
+            catch { }
+
+            try
+            {
+                RobloxWatcher.Instances.Clear();
+                RobloxWatcher.Seen.Clear();
+            }
+            catch { }
+
+            List<Account> Updates = new List<Account>();
+
+            foreach (Account Account in AccountsList)
+            {
+                if (Account == null) continue;
+
+                bool Changed = false;
+
+                if (Account.HasOpenInstance)
+                {
+                    Account.HasOpenInstance = false;
+                    Changed = true;
+                }
+
+                if (Account.IsOnServer)
+                {
+                    Account.IsOnServer = false;
+                    Changed = true;
+                }
+
+                if (Account.CurrentProcessId != 0)
+                {
+                    Account.CurrentProcessId = 0;
+                    Changed = true;
+                }
+
+                if (!string.IsNullOrEmpty(Account.CurrentGameName))
+                {
+                    Account.CurrentGameName = string.Empty;
+                    Account.CurrentPlaceId = null;
+                    Changed = true;
+                }
+
+                if (Changed)
+                    Updates.Add(Account);
+            }
+
+            if (Updates.Count > 0)
+                AccountsView.InvokeIfRequired(() => AccountsView.RefreshObjects(Updates));
+        }
+
+        private async Task<string> JoinWithFailureRecovery(Account account, long placeId, string jobId, bool followUser, bool vipServer, string contextTag, bool allowGlobalReset = true, bool requireNewProcess = false)
+        {
+            if (account == null)
+                return "ERROR: Account is null";
+
+            int baselineProcessCount = requireNewProcess ? GetRobloxPlayerProcessCount() : 0;
+            int previousProcessId = account.CurrentProcessId;
+
+            string result = await account.JoinServer(placeId, jobId, followUser, vipServer);
+            if (IsJoinSuccess(result) && requireNewProcess)
+            {
+                bool launched = await WaitForLaunchEvidence(account, previousProcessId, baselineProcessCount);
+                if (!launched)
+                {
+                    Program.Logger.Warn($"[{contextTag}] Join call for {account.Username} returned but no new process was detected.");
+                    result = "ERROR: Join returned but no new Roblox process was detected for this account.";
+                }
+            }
+
+            if (IsJoinSuccess(result))
+                return result;
+
+            if (!allowGlobalReset)
+            {
+                Program.Logger.Warn($"[{contextTag}] Initial launch failed for {account.Username}: {result}. Retrying once without global reset.");
+
+                if (General.Get<bool>("EnableMultiRbx"))
+                    PrepareMultiRobloxForAccountLaunch();
+
+                await Task.Delay(600);
+
+                int retryBaselineCount = requireNewProcess ? GetRobloxPlayerProcessCount() : 0;
+                int retryPreviousPid = account.CurrentProcessId;
+                string retryNoReset = await account.JoinServer(placeId, jobId, followUser, vipServer);
+
+                if (IsJoinSuccess(retryNoReset) && requireNewProcess)
+                {
+                    bool launched = await WaitForLaunchEvidence(account, retryPreviousPid, retryBaselineCount);
+                    if (!launched)
+                    {
+                        Program.Logger.Warn($"[{contextTag}] Retry join for {account.Username} returned but still no new process was detected.");
+                        retryNoReset = "ERROR: Join returned but no new Roblox process was detected for this account.";
+                    }
+                }
+
+                if (!IsJoinSuccess(retryNoReset))
+                    Program.Logger.Warn($"[{contextTag}] Retry failed for {account.Username}: {retryNoReset}");
+
+                return retryNoReset;
+            }
+
+            Program.Logger.Warn($"[{contextTag}] Initial launch failed for {account.Username}: {result}. Closing all Roblox instances and retrying once.");
+
+            await CloseAllRobloxInstancesForRetry();
+
+            if (General.Get<bool>("EnableMultiRbx"))
+                PrepareMultiRobloxForAccountLaunch();
+
+            await Task.Delay(800);
+
+            int retryProcessCount = requireNewProcess ? GetRobloxPlayerProcessCount() : 0;
+            int retryProcessId = account.CurrentProcessId;
+            string retryResult = await account.JoinServer(placeId, jobId, followUser, vipServer);
+
+            if (IsJoinSuccess(retryResult) && requireNewProcess)
+            {
+                bool launched = await WaitForLaunchEvidence(account, retryProcessId, retryProcessCount);
+                if (!launched)
+                {
+                    Program.Logger.Warn($"[{contextTag}] Retry join for {account.Username} returned but no new process was detected.");
+                    retryResult = "ERROR: Join returned but no new Roblox process was detected for this account.";
+                }
+            }
+
+            if (!IsJoinSuccess(retryResult))
+                Program.Logger.Warn($"[{contextTag}] Retry failed for {account.Username}: {retryResult}");
+
+            return retryResult;
         }
 
         private void Remove_Click(object sender, EventArgs e)
@@ -2093,18 +2877,19 @@ namespace RBX_Alt_Manager
 
         private void AccountsView_SelectedIndexChanged(object sender, EventArgs e)
         {
-            if (AccountsView.SelectedItems.Count != 1)
+            List<Account> selectedNow = GetSelectedAccountsFromView();
+            SelectedAccounts = selectedNow;
+            UpdateSelectionStatusText();
+
+            if (selectedNow.Count != 1)
             {
                 SelectedAccount = null;
                 SelectedAccountItem = null;
 
-                if (AccountsView.SelectedObjects.Count > 1)
-                    SelectedAccounts = AccountsView.SelectedObjects.Cast<Account>().ToList();
-
                 return;
             }
 
-            SelectedAccount = AccountsView.SelectedObject as Account;
+            SelectedAccount = selectedNow[0];
             SelectedAccountItem = AccountsView.SelectedItem;
 
             if (SelectedAccount == null) return;
@@ -2134,93 +2919,6 @@ namespace RBX_Alt_Manager
             RefreshView();
         }
 
-        private static string GenerateUniqueBrowserTrackerId(HashSet<string> used)
-        {
-            while (true)
-            {
-                string id;
-                lock (browserTrackerLock)
-                    id = browserTrackerRandom.Next(100000, 175000).ToString() + browserTrackerRandom.Next(100000, 900000).ToString();
-
-                if (!string.IsNullOrEmpty(id) && used.Add(id))
-                    return id;
-            }
-        }
-
-        private void EnsureUniqueBrowserTrackerIds(IEnumerable<Account> targets)
-        {
-            if (targets == null) return;
-
-            HashSet<Account> targetSet = new HashSet<Account>(targets.Where(x => x != null));
-            if (targetSet.Count == 0) return;
-
-            HashSet<string> used = new HashSet<string>(StringComparer.Ordinal);
-
-            foreach (Account account in AccountsList)
-            {
-                if (account == null || targetSet.Contains(account)) continue;
-
-                string tracker = account.BrowserTrackerID?.Trim();
-                if (!string.IsNullOrEmpty(tracker))
-                    used.Add(tracker);
-            }
-
-            bool changed = false;
-
-            foreach (Account account in targetSet)
-            {
-                string tracker = account.BrowserTrackerID?.Trim() ?? string.Empty;
-
-                if (string.IsNullOrEmpty(tracker) || used.Contains(tracker))
-                {
-                    account.BrowserTrackerID = GenerateUniqueBrowserTrackerId(used);
-                    changed = true;
-                    continue;
-                }
-
-                account.BrowserTrackerID = tracker;
-                used.Add(tracker);
-            }
-
-            if (changed)
-                SaveAccounts();
-        }
-
-        private void KillAllInstances_Click(object sender, EventArgs e)
-        {
-            int closed = 0;
-
-            foreach (Process process in Process.GetProcessesByName("RobloxPlayerBeta"))
-            {
-                try
-                {
-                    process.CloseMainWindow();
-                    Thread.Sleep(120);
-
-                    if (!process.HasExited)
-                        process.Kill();
-
-                    closed++;
-                }
-                catch { }
-                finally
-                {
-                    try { process.Dispose(); } catch { }
-                }
-            }
-
-            foreach (Account account in AccountsList)
-            {
-                account.HasOpenInstance = false;
-                account.IsOnServer = false;
-                account.CurrentPlaceId = null;
-                account.CurrentGameName = string.Empty;
-            }
-
-            AccountsView.InvokeIfRequired(() => AccountsView.RefreshObjects(AccountsList));
-            MessageBox.Show($"Closed {closed} Roblox instance(s).", "Roblox Account Manager", MessageBoxButtons.OK, MessageBoxIcon.Information);
-        }
-
         private void JoinServer_Click(object sender, EventArgs e)
         {
             Match IDMatch = Regex.Match(PlaceID.Text, @"\/games\/(\d+)[\/|\?]?"); // idiotproofing
@@ -2244,29 +2942,33 @@ namespace RBX_Alt_Manager
 
             CancelLaunching();
 
-            List<Account> LaunchTargets = AccountsView.SelectedObjects.Cast<Account>().Where(account => account != null).Distinct().ToList();
-            bool LaunchMultiple = LaunchTargets.Count > 1;
-            Account SingleTarget = LaunchTargets.Count == 1 ? LaunchTargets[0] : SelectedAccount;
-            string JoinJobId = VIPServer ? JobID.Text.Substring(4) : JobID.Text;
-
-            EnsureUniqueBrowserTrackerIds(LaunchTargets);
-
-            if (LaunchMultiple && !EnsureMultiRobloxForBulkLaunch())
+            List<Account> LaunchTargets = GetLaunchTargetsSnapshot();
+            if (LaunchTargets.Count == 0)
+            {
+                MessageBox.Show("Select at least one account to launch.", "Roblox Account Manager", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
+            }
+
+            bool LaunchMultiple = LaunchTargets.Count > 1;
+            Account SingleTarget = LaunchTargets.Count == 1 ? LaunchTargets[0] : null;
+            string JoinJobId = VIPServer ? JobID.Text.Substring(4) : JobID.Text;
 
             new Thread(async () => // finally fixing an ancient bug in a dumb way, p.s. i do not condone this.
             {
                 if (LaunchMultiple)
                 {
+                    if (!EnsureMultiRobloxForBulkLaunch())
+                        Program.Logger.Warn("[BulkLaunch] Multi Roblox prep failed in pre-check; continuing with best-effort launch.");
+
                     LauncherToken = new CancellationTokenSource();
 
                     await LaunchAccounts(LaunchTargets, PlaceId, JoinJobId, false, VIPServer);
                 }
                 else if (SingleTarget != null)
                 {
-                    string res = await SingleTarget.JoinServer(PlaceId, JoinJobId, false, VIPServer);
+                    string res = await JoinWithFailureRecovery(SingleTarget, PlaceId, JoinJobId, false, VIPServer, "JoinServer");
 
-                    if (!res.Contains("Success"))
+                    if (!IsJoinSuccess(res))
                         MessageBox.Show(res);
                 }
             }).Start();
@@ -2285,26 +2987,33 @@ namespace RBX_Alt_Manager
 
             CancelLaunching();
 
-            List<Account> LaunchTargets = AccountsView.SelectedObjects.Cast<Account>().Where(account => account != null).Distinct().ToList();
-            bool LaunchMultiple = LaunchTargets.Count > 1;
-            Account SingleTarget = LaunchTargets.Count == 1 ? LaunchTargets[0] : SelectedAccount;
-
-            EnsureUniqueBrowserTrackerIds(LaunchTargets);
-
-            if (LaunchMultiple && !EnsureMultiRobloxForBulkLaunch())
+            List<Account> LaunchTargets = GetLaunchTargetsSnapshot();
+            if (LaunchTargets.Count == 0)
+            {
+                MessageBox.Show("Select at least one account to launch.", "Roblox Account Manager", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
+            }
+
+            bool LaunchMultiple = LaunchTargets.Count > 1;
+            Account SingleTarget = LaunchTargets.Count == 1 ? LaunchTargets[0] : null;
 
             if (LaunchMultiple)
             {
                 LauncherToken = new CancellationTokenSource();
 
-                await LaunchAccounts(LaunchTargets, UserId, "", true);
+                await Task.Run(async () =>
+                {
+                    if (!EnsureMultiRobloxForBulkLaunch())
+                        Program.Logger.Warn("[FollowLaunch] Multi Roblox prep failed in pre-check; continuing with best-effort launch.");
+
+                    await LaunchAccounts(LaunchTargets, UserId, "", true);
+                });
             }
             else if (SingleTarget != null)
             {
-                string res = await SingleTarget.JoinServer(UserId, "", true);
+                string res = await JoinWithFailureRecovery(SingleTarget, UserId, "", true, false, "FollowJoin");
 
-                if (!res.Contains("Success"))
+                if (!IsJoinSuccess(res))
                     MessageBox.Show(res);
             }
         }
@@ -2385,6 +3094,8 @@ namespace RBX_Alt_Manager
             LiveStatusTimer?.Dispose();
             PresenceTimer?.Stop();
             PresenceTimer?.Dispose();
+            ProcessOptimizerTimer?.Stop();
+            ProcessOptimizerTimer?.Dispose();
 
             if (PlaceID == null || string.IsNullOrEmpty(PlaceID.Text)) return;
 
@@ -2789,27 +3500,32 @@ namespace RBX_Alt_Manager
 
         private async Task LaunchAccounts(List<Account> Accounts, long PlaceID, string JobID, bool FollowUser = false, bool VIPServer = false)
         {
-            EnsureUniqueBrowserTrackerIds(Accounts);
-
             int Delay = General.Exists("AccountJoinDelay") ? General.Get<int>("AccountJoinDelay") : 8;
 
             bool AsyncJoin = General.Get<bool>("AsyncJoin");
             CancellationTokenSource Token = LauncherToken;
             List<string> Failures = new List<string>();
-            bool RestoreAutoCloseLastProcess = false;
+            bool MultiLaunch = Accounts != null && Accounts.Count > 1;
 
-            if (Accounts != null && Accounts.Count > 1 && General.Get<bool>("AutoCloseLastProcess"))
-            {
-                General.Set("AutoCloseLastProcess", "false");
-                RestoreAutoCloseLastProcess = true;
-                IniSettings.Save("RAMSettings.ini");
-            }
+            if (MultiLaunch)
+                AsyncJoin = false; // Always run selected multi-launch as strict queue.
+
+            Interlocked.Exchange(ref BulkLaunchInProgress, 1);
+            NormalizeBrowserTrackerIds();
 
             try
             {
-                foreach (Account account in Accounts)
+                int total = Accounts?.Count ?? 0;
+                int index = 0;
+
+                foreach (Account account in Accounts ?? Enumerable.Empty<Account>())
                 {
-                    if (Token.IsCancellationRequested) break;
+                    index++;
+
+                    if (Token != null && Token.IsCancellationRequested)
+                        break;
+
+                    Program.Logger.Info($"[BulkLaunch] Launching {index}/{total}: {account?.Username ?? "unknown"}");
 
                     long PlaceId = PlaceID;
                     string JobId = JobID;
@@ -2820,11 +3536,23 @@ namespace RBX_Alt_Manager
                         if (!string.IsNullOrEmpty(account.GetField("SavedJobId"))) JobId = account.GetField("SavedJobId");
                     }
 
-                    string Result = await account.JoinServer(PlaceId, JobId, FollowUser, VIPServer);
-                    if (!Result.Contains("Success"))
+                    try
                     {
-                        Program.Logger.Warn($"[BulkLaunch] Failed launching {account.Username}: {Result}");
-                        Failures.Add($"{account.Username}: {Result.Split('\n').FirstOrDefault() ?? Result}");
+                        string Result = await JoinWithFailureRecovery(account, PlaceId, JobId, FollowUser, VIPServer, "BulkLaunch", allowGlobalReset: false, requireNewProcess: true);
+                        if (!IsJoinSuccess(Result))
+                        {
+                            Program.Logger.Warn($"[BulkLaunch] Failed launching {account.Username}: {Result}");
+                            Failures.Add($"{account.Username}: {Result.Split('\n').FirstOrDefault() ?? Result}");
+                        }
+                        else
+                        {
+                            Program.Logger.Info($"[BulkLaunch] Success launching {index}/{total}: {account.Username}");
+                        }
+                    }
+                    catch (Exception x)
+                    {
+                        Program.Logger.Error($"[BulkLaunch] Exception launching {account?.Username ?? "unknown"}: {x}");
+                        Failures.Add($"{account?.Username ?? "unknown"}: {x.Message}");
                     }
 
                     if (AsyncJoin)
@@ -2840,17 +3568,16 @@ namespace RBX_Alt_Manager
             }
             finally
             {
-                if (RestoreAutoCloseLastProcess)
+                LaunchNext = false;
+
+                if (Token != null)
                 {
-                    General.Set("AutoCloseLastProcess", "true");
-                    IniSettings.Save("RAMSettings.ini");
+                    try { Token.Cancel(); } catch { }
+                    try { Token.Dispose(); } catch { }
                 }
+
+                Interlocked.Exchange(ref BulkLaunchInProgress, 0);
             }
-
-            LaunchNext = false;
-
-            Token.Cancel();
-            Token.Dispose();
 
             if (Failures.Count > 0)
                 this.InvokeIfRequired(() => MessageBox.Show($"Some accounts failed to launch:\n\n{string.Join("\n", Failures)}", "Roblox Account Manager", MessageBoxButtons.OK, MessageBoxIcon.Warning));
@@ -2950,6 +3677,184 @@ namespace RBX_Alt_Manager
             }
         }
 
+        private static bool TryParsePriorityClass(string value, out ProcessPriorityClass priorityClass)
+        {
+            priorityClass = ProcessPriorityClass.Normal;
+
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            switch (value.Trim().ToLowerInvariant())
+            {
+                case "idle":
+                    priorityClass = ProcessPriorityClass.Idle;
+                    return true;
+                case "belownormal":
+                    priorityClass = ProcessPriorityClass.BelowNormal;
+                    return true;
+                case "normal":
+                    priorityClass = ProcessPriorityClass.Normal;
+                    return true;
+                case "abovenormal":
+                    priorityClass = ProcessPriorityClass.AboveNormal;
+                    return true;
+                case "high":
+                    priorityClass = ProcessPriorityClass.High;
+                    return true;
+                case "realtime":
+                    priorityClass = ProcessPriorityClass.RealTime;
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private static int ParseIoPriorityHint(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return -1;
+
+            switch (value.Trim().ToLowerInvariant())
+            {
+                case "verylow":
+                    return 0;
+                case "low":
+                    return 1;
+                case "normal":
+                    return 2;
+                default:
+                    return -1;
+            }
+        }
+
+        private static bool TryParseAffinityMask(string value, out IntPtr affinity)
+        {
+            affinity = IntPtr.Zero;
+
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            string raw = value.Trim();
+            if (raw.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                raw = raw.Substring(2);
+
+            if (!ulong.TryParse(raw, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out ulong parsed) || parsed == 0)
+                return false;
+
+            affinity = IntPtr.Size == 8 ? new IntPtr(unchecked((long)parsed)) : new IntPtr(unchecked((int)parsed));
+            return true;
+        }
+
+        private static void TrySetIoPriority(Process process, string ioPrioritySetting)
+        {
+            int hint = ParseIoPriorityHint(ioPrioritySetting);
+            if (hint < 0)
+                return;
+
+            try
+            {
+                NtSetInformationProcess(process.Handle, ProcessIoPriorityClass, ref hint, sizeof(int));
+            }
+            catch { }
+        }
+
+        private void ApplyManagerPriority()
+        {
+            if (!General.Get<bool>("RaiseManagerPriority"))
+                return;
+
+            if (!TryParsePriorityClass(General.Get("ManagerPriority"), out ProcessPriorityClass managerPriority))
+                managerPriority = ProcessPriorityClass.AboveNormal;
+
+            using (Process current = Process.GetCurrentProcess())
+            {
+                try
+                {
+                    if (current.PriorityClass != managerPriority)
+                        current.PriorityClass = managerPriority;
+                }
+                catch { }
+            }
+        }
+
+        public void ApplyRobloxProcessOptimization(Process process)
+        {
+            if (process == null || !General.Get<bool>("EnableProcessOptimizer"))
+                return;
+
+            try
+            {
+                if (process.HasExited)
+                    return;
+            }
+            catch
+            {
+                return;
+            }
+
+            try { process.PriorityBoostEnabled = false; } catch { }
+
+            if (TryParsePriorityClass(General.Get("RobloxPriority"), out ProcessPriorityClass robloxPriority))
+            {
+                try
+                {
+                    if (process.PriorityClass != robloxPriority)
+                        process.PriorityClass = robloxPriority;
+                }
+                catch { }
+            }
+
+            TrySetIoPriority(process, General.Get("RobloxIoPriority"));
+
+            if (TryParseAffinityMask(General.Get("RobloxAffinityMask"), out IntPtr affinity))
+            {
+                try
+                {
+                    process.ProcessorAffinity = affinity;
+                }
+                catch { }
+            }
+
+            try
+            {
+                EmptyWorkingSet(process.Handle);
+            }
+            catch { }
+        }
+
+        private void TryApplyProcessOptimization()
+        {
+            if (Interlocked.Exchange(ref ProcessOptimizerInProgress, 1) == 1)
+                return;
+
+            try
+            {
+                ApplyManagerPriority();
+
+                if (!General.Get<bool>("EnableProcessOptimizer"))
+                    return;
+
+                foreach (Process process in Process.GetProcessesByName("RobloxPlayerBeta"))
+                {
+                    try
+                    {
+                        ApplyRobloxProcessOptimization(process);
+                    }
+                    catch { }
+                    finally { process.Dispose(); }
+                }
+            }
+            finally
+            {
+                Interlocked.Exchange(ref ProcessOptimizerInProgress, 0);
+            }
+        }
+
+        public void ApplyProcessOptimizationNow()
+        {
+            Task.Run(() => TryApplyProcessOptimization());
+        }
+
         private CancellationTokenSource PresenceCancellationToken;
 
         public void UpdatePresenceTimerInterval()
@@ -2987,16 +3892,20 @@ namespace RBX_Alt_Manager
             return trackerMatch.Success && trackerMatch.Groups.Count >= 2 ? trackerMatch.Groups[1].Value : string.Empty;
         }
 
-        private Dictionary<string, bool?> GetOpenInstanceStates()
+        private Dictionary<string, OpenInstanceState> GetOpenInstanceStates()
         {
-            Dictionary<string, bool?> States = new Dictionary<string, bool?>();
+            Dictionary<string, OpenInstanceState> States = new Dictionary<string, OpenInstanceState>();
 
             try
             {
                 foreach (RobloxProcess Instance in RobloxWatcher.Instances.ToArray())
                 {
                     if (Instance == null || string.IsNullOrEmpty(Instance.BrowserTrackerID)) continue;
-                    States[Instance.BrowserTrackerID] = Instance.IsConnectedToServer;
+                    States[Instance.BrowserTrackerID] = new OpenInstanceState
+                    {
+                        IsConnectedToServer = Instance.IsConnectedToServer,
+                        ProcessId = Math.Max(0, Instance.ProcessId)
+                    };
                 }
             }
             catch { }
@@ -3010,7 +3919,11 @@ namespace RBX_Alt_Manager
                     if (string.IsNullOrEmpty(TrackerID) || States.ContainsKey(TrackerID))
                         continue;
 
-                    States.Add(TrackerID, null);
+                    States.Add(TrackerID, new OpenInstanceState
+                    {
+                        IsConnectedToServer = null,
+                        ProcessId = process.Id
+                    });
                 }
                 catch { }
                 finally { process.Dispose(); }
@@ -3160,7 +4073,7 @@ namespace RBX_Alt_Manager
         {
             if (AccountsList == null || AccountsList.Count == 0) return;
 
-            Dictionary<string, bool?> States = GetOpenInstanceStates();
+            Dictionary<string, OpenInstanceState> States = GetOpenInstanceStates();
             List<Account> Changed = new List<Account>();
             List<Account> GameNameChanged = new List<Account>();
             List<Account> PresenceFallback = new List<Account>();
@@ -3168,10 +4081,25 @@ namespace RBX_Alt_Manager
 
             foreach (Account account in AccountsList)
             {
+                OpenInstanceState InstanceState = null;
+                int CurrentPid = 0;
+
+                if (!string.IsNullOrEmpty(account.BrowserTrackerID) && States.TryGetValue(account.BrowserTrackerID, out OpenInstanceState TrackerState))
+                {
+                    InstanceState = TrackerState;
+                    CurrentPid = Math.Max(0, TrackerState.ProcessId);
+                }
+
                 if (TryGetScriptLiveStatusOverride(account, out ScriptLiveStatusOverride Override))
                 {
                     bool GameChanged;
                     bool StateChanged = ApplyScriptLiveStatusOverride(account, Override, out GameChanged);
+
+                    if (account.CurrentProcessId != CurrentPid)
+                    {
+                        account.CurrentProcessId = CurrentPid;
+                        StateChanged = true;
+                    }
 
                     if (StateChanged)
                         Changed.Add(account);
@@ -3187,9 +4115,11 @@ namespace RBX_Alt_Manager
                 bool HasOpenInstance = false;
                 bool IsOnServer = false;
 
-                if (!string.IsNullOrEmpty(account.BrowserTrackerID) && States.TryGetValue(account.BrowserTrackerID, out bool? ServerState))
+                if (InstanceState != null)
                 {
                     HasOpenInstance = true;
+
+                    bool? ServerState = InstanceState.IsConnectedToServer;
 
                     if (ServerState.HasValue)
                     {
@@ -3207,10 +4137,11 @@ namespace RBX_Alt_Manager
                     }
                 }
 
-                if (account.HasOpenInstance != HasOpenInstance || account.IsOnServer != IsOnServer)
+                if (account.HasOpenInstance != HasOpenInstance || account.IsOnServer != IsOnServer || account.CurrentProcessId != CurrentPid)
                 {
                     account.HasOpenInstance = HasOpenInstance;
                     account.IsOnServer = IsOnServer;
+                    account.CurrentProcessId = CurrentPid;
                     Changed.Add(account);
                 }
             }

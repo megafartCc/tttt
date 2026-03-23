@@ -28,6 +28,7 @@ namespace RBX_Alt_Manager.Classes
         const string TimestampRegex = @"[\d+\-]+T[\d+:]+\.\w+Z,[\d.+]+,\w+,\d+[\s+]?";
         public string BrowserTrackerID { get; private set; } = string.Empty;
         public bool IsConnectedToServer => IsConnected;
+        public int ProcessId => RbxProcess?.Id ?? -1;
 
         private static readonly Dictionary<string, string> Matches = new Dictionary<string, string>{
             { "DataModelInit", @"\[FLog::UGCGameController\] UGCGameController, initialized DataModel\((\w+)\)" },

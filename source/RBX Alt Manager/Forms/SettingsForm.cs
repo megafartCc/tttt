@@ -1,7 +1,9 @@
 ﻿using Microsoft.Win32;
 using System;
+using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
 
@@ -12,7 +14,42 @@ namespace RBX_Alt_Manager.Forms
         private bool SettingsLoaded = false;
         private RegistryKey StartupKey;
         private CheckBox AutoRejoinCB;
+        private CheckBox EnableProcessOptimizerCB;
+        private Label RobloxPriorityLabel;
+        private ComboBox RobloxPriorityCombo;
+        private Label RobloxIoPriorityLabel;
+        private ComboBox RobloxIoPriorityCombo;
+        private Label RobloxAffinityMaskLabel;
+        private TextBox RobloxAffinityMaskTB;
+        private CheckBox RaiseManagerPriorityCB;
+        private Label ManagerPriorityLabel;
+        private ComboBox ManagerPriorityCombo;
+        private Label ProcessLassoPathLabel;
+        private TextBox ProcessLassoPathTB;
+        private Button OpenProcessLassoButton;
+        private Label RAMMapPathLabel;
+        private TextBox RAMMapPathTB;
+        private Button OpenRAMMapButton;
+        private Label MemoryMonitorLabel;
+        private Timer PerformanceMonitorTimer;
         private const long AutoRejoinPlaceId = 109983668079237;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+        private struct MEMORYSTATUSEX
+        {
+            public uint dwLength;
+            public uint dwMemoryLoad;
+            public ulong ullTotalPhys;
+            public ulong ullAvailPhys;
+            public ulong ullTotalPageFile;
+            public ulong ullAvailPageFile;
+            public ulong ullTotalVirtual;
+            public ulong ullAvailVirtual;
+            public ulong ullAvailExtendedVirtual;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
 
         public SettingsForm()
         {
@@ -20,6 +57,7 @@ namespace RBX_Alt_Manager.Forms
 
             InitializeComponent();
             InitializeAutoRejoinControl();
+            InitializePerformanceControls();
             this.Rescale();
         }
 
@@ -32,7 +70,7 @@ namespace RBX_Alt_Manager.Forms
                 Text = "Auto Rejoin"
             };
 
-            Helper.SetToolTip(AutoRejoinCB, $"If an active account has no live signal for 1m 45s, RAM relaunches it to place {AutoRejoinPlaceId}.");
+            Helper.SetToolTip(AutoRejoinCB, $"If an active account has no in-game signal for 1m 25s, RAM relaunches it to place {AutoRejoinPlaceId}.");
             AutoRejoinCB.CheckedChanged += AutoRejoinCB_CheckedChanged;
 
             int InsertAfter = SettingsLayoutPanel.Controls.IndexOf(AutoCookieRefreshCB);
@@ -42,6 +80,264 @@ namespace RBX_Alt_Manager.Forms
 
             if (InsertAfter >= 0)
                 SettingsLayoutPanel.Controls.SetChildIndex(AutoRejoinCB, InsertAfter + 1);
+        }
+
+        private void InitializePerformanceControls()
+        {
+            MiscellaneousFlowPanel.AutoScroll = true;
+
+            EnableProcessOptimizerCB = new CheckBox
+            {
+                AutoSize = true,
+                Name = "EnableProcessOptimizerCB",
+                Text = "Enable Process Optimizer"
+            };
+            EnableProcessOptimizerCB.CheckedChanged += EnableProcessOptimizerCB_CheckedChanged;
+
+            RobloxPriorityLabel = new Label
+            {
+                AutoSize = true,
+                Text = "Roblox Priority"
+            };
+
+            RobloxPriorityCombo = new ComboBox
+            {
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Width = 120,
+                Name = "RobloxPriorityCombo"
+            };
+            RobloxPriorityCombo.Items.AddRange(new object[] { "Idle", "BelowNormal", "Normal", "AboveNormal", "High" });
+            RobloxPriorityCombo.SelectedIndexChanged += RobloxPriorityCombo_SelectedIndexChanged;
+
+            RobloxIoPriorityLabel = new Label
+            {
+                AutoSize = true,
+                Text = "Roblox I/O Priority"
+            };
+
+            RobloxIoPriorityCombo = new ComboBox
+            {
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Width = 120,
+                Name = "RobloxIoPriorityCombo"
+            };
+            RobloxIoPriorityCombo.Items.AddRange(new object[] { "VeryLow", "Low", "Normal" });
+            RobloxIoPriorityCombo.SelectedIndexChanged += RobloxIoPriorityCombo_SelectedIndexChanged;
+
+            RobloxAffinityMaskLabel = new Label
+            {
+                AutoSize = true,
+                Text = "Roblox Affinity Mask (hex)"
+            };
+
+            RobloxAffinityMaskTB = new TextBox
+            {
+                Name = "RobloxAffinityMaskTB",
+                Width = 269,
+                Text = ""
+            };
+            RobloxAffinityMaskTB.TextChanged += RobloxAffinityMaskTB_TextChanged;
+
+            RaiseManagerPriorityCB = new CheckBox
+            {
+                AutoSize = true,
+                Name = "RaiseManagerPriorityCB",
+                Text = "Keep RAMV2 Priority Elevated"
+            };
+            RaiseManagerPriorityCB.CheckedChanged += RaiseManagerPriorityCB_CheckedChanged;
+
+            ManagerPriorityLabel = new Label
+            {
+                AutoSize = true,
+                Text = "RAMV2 Priority"
+            };
+
+            ManagerPriorityCombo = new ComboBox
+            {
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Width = 120,
+                Name = "ManagerPriorityCombo"
+            };
+            ManagerPriorityCombo.Items.AddRange(new object[] { "Normal", "AboveNormal", "High" });
+            ManagerPriorityCombo.SelectedIndexChanged += ManagerPriorityCombo_SelectedIndexChanged;
+
+            ProcessLassoPathLabel = new Label
+            {
+                AutoSize = true,
+                Text = "Process Lasso Path"
+            };
+
+            ProcessLassoPathTB = new TextBox
+            {
+                Name = "ProcessLassoPathTB",
+                Width = 269
+            };
+            ProcessLassoPathTB.TextChanged += ProcessLassoPathTB_TextChanged;
+
+            OpenProcessLassoButton = new Button
+            {
+                Name = "OpenProcessLassoButton",
+                Text = "Open Process Lasso",
+                Width = 269
+            };
+            OpenProcessLassoButton.Click += OpenProcessLassoButton_Click;
+
+            RAMMapPathLabel = new Label
+            {
+                AutoSize = true,
+                Text = "RAMMap Path"
+            };
+
+            RAMMapPathTB = new TextBox
+            {
+                Name = "RAMMapPathTB",
+                Width = 269
+            };
+            RAMMapPathTB.TextChanged += RAMMapPathTB_TextChanged;
+
+            OpenRAMMapButton = new Button
+            {
+                Name = "OpenRAMMapButton",
+                Text = "Open RAMMap",
+                Width = 269
+            };
+            OpenRAMMapButton.Click += OpenRAMMapButton_Click;
+
+            MemoryMonitorLabel = new Label
+            {
+                AutoSize = true,
+                Name = "MemoryMonitorLabel",
+                Width = 269
+            };
+
+            PerformanceMonitorTimer = new Timer { Interval = 2000 };
+            PerformanceMonitorTimer.Tick += (s, e) => UpdateMemoryMonitor();
+
+            Helper.SetToolTip(EnableProcessOptimizerCB, "Applies selected priority, I/O priority and affinity mask to RobloxPlayerBeta processes.");
+            Helper.SetToolTip(RobloxAffinityMaskTB, "Example: FF (cores 1-8), F0, 0x3F. Leave empty to use all cores.");
+            Helper.SetToolTip(OpenProcessLassoButton, "Open configured Process Lasso path, or its official site if missing.");
+            Helper.SetToolTip(OpenRAMMapButton, "Open configured RAMMap path, or Microsoft docs if missing.");
+
+            MiscellaneousFlowPanel.Controls.Remove(ForceUpdateButton);
+
+            MiscellaneousFlowPanel.Controls.Add(EnableProcessOptimizerCB);
+            MiscellaneousFlowPanel.SetFlowBreak(EnableProcessOptimizerCB, true);
+            MiscellaneousFlowPanel.Controls.Add(RobloxPriorityLabel);
+            MiscellaneousFlowPanel.Controls.Add(RobloxPriorityCombo);
+            MiscellaneousFlowPanel.SetFlowBreak(RobloxPriorityCombo, true);
+            MiscellaneousFlowPanel.Controls.Add(RobloxIoPriorityLabel);
+            MiscellaneousFlowPanel.Controls.Add(RobloxIoPriorityCombo);
+            MiscellaneousFlowPanel.SetFlowBreak(RobloxIoPriorityCombo, true);
+            MiscellaneousFlowPanel.Controls.Add(RobloxAffinityMaskLabel);
+            MiscellaneousFlowPanel.SetFlowBreak(RobloxAffinityMaskLabel, true);
+            MiscellaneousFlowPanel.Controls.Add(RobloxAffinityMaskTB);
+            MiscellaneousFlowPanel.SetFlowBreak(RobloxAffinityMaskTB, true);
+            MiscellaneousFlowPanel.Controls.Add(RaiseManagerPriorityCB);
+            MiscellaneousFlowPanel.SetFlowBreak(RaiseManagerPriorityCB, true);
+            MiscellaneousFlowPanel.Controls.Add(ManagerPriorityLabel);
+            MiscellaneousFlowPanel.Controls.Add(ManagerPriorityCombo);
+            MiscellaneousFlowPanel.SetFlowBreak(ManagerPriorityCombo, true);
+            MiscellaneousFlowPanel.Controls.Add(ProcessLassoPathLabel);
+            MiscellaneousFlowPanel.SetFlowBreak(ProcessLassoPathLabel, true);
+            MiscellaneousFlowPanel.Controls.Add(ProcessLassoPathTB);
+            MiscellaneousFlowPanel.SetFlowBreak(ProcessLassoPathTB, true);
+            MiscellaneousFlowPanel.Controls.Add(OpenProcessLassoButton);
+            MiscellaneousFlowPanel.SetFlowBreak(OpenProcessLassoButton, true);
+            MiscellaneousFlowPanel.Controls.Add(RAMMapPathLabel);
+            MiscellaneousFlowPanel.SetFlowBreak(RAMMapPathLabel, true);
+            MiscellaneousFlowPanel.Controls.Add(RAMMapPathTB);
+            MiscellaneousFlowPanel.SetFlowBreak(RAMMapPathTB, true);
+            MiscellaneousFlowPanel.Controls.Add(OpenRAMMapButton);
+            MiscellaneousFlowPanel.SetFlowBreak(OpenRAMMapButton, true);
+            MiscellaneousFlowPanel.Controls.Add(MemoryMonitorLabel);
+            MiscellaneousFlowPanel.SetFlowBreak(MemoryMonitorLabel, true);
+
+            MiscellaneousFlowPanel.Controls.Add(ForceUpdateButton);
+            MiscellaneousFlowPanel.SetFlowBreak(ForceUpdateButton, true);
+        }
+
+        private static void SetComboValue(ComboBox comboBox, string value, string fallback)
+        {
+            string target = string.IsNullOrWhiteSpace(value) ? fallback : value;
+
+            foreach (var item in comboBox.Items)
+            {
+                if (string.Equals(item?.ToString(), target, StringComparison.OrdinalIgnoreCase))
+                {
+                    comboBox.SelectedItem = item;
+                    return;
+                }
+            }
+
+            if (comboBox.Items.Count > 0)
+                comboBox.SelectedIndex = 0;
+        }
+
+        private static string FormatMb(long bytes) => $"{bytes / (1024d * 1024d):N0} MB";
+
+        private void UpdateMemoryMonitor()
+        {
+            try
+            {
+                int robloxCount = 0;
+                long robloxWorkingSet = 0;
+                long robloxPrivate = 0;
+
+                foreach (var process in Process.GetProcessesByName("RobloxPlayerBeta"))
+                {
+                    try
+                    {
+                        robloxCount++;
+                        robloxWorkingSet += process.WorkingSet64;
+                        robloxPrivate += process.PrivateMemorySize64;
+                    }
+                    catch { }
+                    finally { process.Dispose(); }
+                }
+
+                long managerWorkingSet = 0;
+                using (var current = Process.GetCurrentProcess())
+                    managerWorkingSet = current.WorkingSet64;
+
+                MEMORYSTATUSEX memoryStatus = new MEMORYSTATUSEX
+                {
+                    dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX))
+                };
+
+                ulong total = 0;
+                ulong available = 0;
+                uint loadPercent = 0;
+                if (GlobalMemoryStatusEx(ref memoryStatus))
+                {
+                    total = memoryStatus.ullTotalPhys;
+                    available = memoryStatus.ullAvailPhys;
+                    loadPercent = memoryStatus.dwMemoryLoad;
+                }
+
+                MemoryMonitorLabel.Text =
+                    $"Roblox Instances: {robloxCount}\n" +
+                    $"Roblox Working Set: {FormatMb(robloxWorkingSet)}\n" +
+                    $"Roblox Private: {FormatMb(robloxPrivate)}\n" +
+                    $"RAMV2 Working Set: {FormatMb(managerWorkingSet)}\n" +
+                    $"System RAM: {FormatMb((long)available)} free / {FormatMb((long)total)} total ({loadPercent}% used)";
+            }
+            catch
+            {
+                MemoryMonitorLabel.Text = "Memory monitor unavailable.";
+            }
+        }
+
+        private static void OpenToolOrWebsite(string configuredPath, string fallbackUrl)
+        {
+            string path = (configuredPath ?? string.Empty).Trim().Trim('"');
+
+            if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
+            {
+                Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+                return;
+            }
+
+            Process.Start(fallbackUrl);
         }
 
         private void SettingsForm_Load(object sender, EventArgs e)
@@ -78,6 +374,16 @@ namespace RBX_Alt_Manager.Forms
             PresenceUpdateRateNum .Value = AccountManager.General.Get<int>("PresenceUpdateRate");
             UnlockFPSCB.Checked = AccountManager.General.Get<bool>("UnlockFPS");
             MaxFPSValue.Value = AccountManager.General.Get<int>("MaxFPSValue");
+            EnableProcessOptimizerCB.Checked = AccountManager.General.Get<bool>("EnableProcessOptimizer");
+            SetComboValue(RobloxPriorityCombo, AccountManager.General.Get("RobloxPriority"), "BelowNormal");
+            SetComboValue(RobloxIoPriorityCombo, AccountManager.General.Get("RobloxIoPriority"), "Low");
+            RobloxAffinityMaskTB.Text = AccountManager.General.Get("RobloxAffinityMask");
+            RaiseManagerPriorityCB.Checked = AccountManager.General.Get<bool>("RaiseManagerPriority");
+            SetComboValue(ManagerPriorityCombo, AccountManager.General.Get("ManagerPriority"), "AboveNormal");
+            ProcessLassoPathTB.Text = AccountManager.General.Get("ProcessLassoPath");
+            RAMMapPathTB.Text = AccountManager.General.Get("RAMMapPath");
+            UpdateMemoryMonitor();
+            PerformanceMonitorTimer.Start();
 
             if (AccountManager.General.Exists("CustomClientSettings") && File.Exists(AccountManager.General.Get<string>("CustomClientSettings")))
             {
@@ -355,6 +661,86 @@ namespace RBX_Alt_Manager.Forms
 
             AccountManager.General.Set("MaxFPSValue", MaxFPSValue.Value.ToString());
             AccountManager.IniSettings.Save("RAMSettings.ini");
+        }
+
+        private void EnableProcessOptimizerCB_CheckedChanged(object sender, EventArgs e)
+        {
+            if (!SettingsLoaded) return;
+
+            AccountManager.General.Set("EnableProcessOptimizer", EnableProcessOptimizerCB.Checked ? "true" : "false");
+            AccountManager.IniSettings.Save("RAMSettings.ini");
+            AccountManager.Instance?.ApplyProcessOptimizationNow();
+        }
+
+        private void RobloxPriorityCombo_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            if (!SettingsLoaded) return;
+
+            AccountManager.General.Set("RobloxPriority", RobloxPriorityCombo.SelectedItem?.ToString() ?? "BelowNormal");
+            AccountManager.IniSettings.Save("RAMSettings.ini");
+            AccountManager.Instance?.ApplyProcessOptimizationNow();
+        }
+
+        private void RobloxIoPriorityCombo_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            if (!SettingsLoaded) return;
+
+            AccountManager.General.Set("RobloxIoPriority", RobloxIoPriorityCombo.SelectedItem?.ToString() ?? "Low");
+            AccountManager.IniSettings.Save("RAMSettings.ini");
+            AccountManager.Instance?.ApplyProcessOptimizationNow();
+        }
+
+        private void RobloxAffinityMaskTB_TextChanged(object sender, EventArgs e)
+        {
+            if (!SettingsLoaded) return;
+
+            AccountManager.General.Set("RobloxAffinityMask", (RobloxAffinityMaskTB.Text ?? string.Empty).Trim());
+            AccountManager.IniSettings.Save("RAMSettings.ini");
+            AccountManager.Instance?.ApplyProcessOptimizationNow();
+        }
+
+        private void RaiseManagerPriorityCB_CheckedChanged(object sender, EventArgs e)
+        {
+            if (!SettingsLoaded) return;
+
+            AccountManager.General.Set("RaiseManagerPriority", RaiseManagerPriorityCB.Checked ? "true" : "false");
+            AccountManager.IniSettings.Save("RAMSettings.ini");
+            AccountManager.Instance?.ApplyProcessOptimizationNow();
+        }
+
+        private void ManagerPriorityCombo_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            if (!SettingsLoaded) return;
+
+            AccountManager.General.Set("ManagerPriority", ManagerPriorityCombo.SelectedItem?.ToString() ?? "AboveNormal");
+            AccountManager.IniSettings.Save("RAMSettings.ini");
+            AccountManager.Instance?.ApplyProcessOptimizationNow();
+        }
+
+        private void ProcessLassoPathTB_TextChanged(object sender, EventArgs e)
+        {
+            if (!SettingsLoaded) return;
+
+            AccountManager.General.Set("ProcessLassoPath", ProcessLassoPathTB.Text ?? string.Empty);
+            AccountManager.IniSettings.Save("RAMSettings.ini");
+        }
+
+        private void RAMMapPathTB_TextChanged(object sender, EventArgs e)
+        {
+            if (!SettingsLoaded) return;
+
+            AccountManager.General.Set("RAMMapPath", RAMMapPathTB.Text ?? string.Empty);
+            AccountManager.IniSettings.Save("RAMSettings.ini");
+        }
+
+        private void OpenProcessLassoButton_Click(object sender, EventArgs e)
+        {
+            OpenToolOrWebsite(ProcessLassoPathTB.Text, "https://bitsum.com/");
+        }
+
+        private void OpenRAMMapButton_Click(object sender, EventArgs e)
+        {
+            OpenToolOrWebsite(RAMMapPathTB.Text, "https://learn.microsoft.com/en-us/sysinternals/downloads/rammap");
         }
 
         private void OverrideWithCustomCB_CheckedChanged(object sender, EventArgs e)

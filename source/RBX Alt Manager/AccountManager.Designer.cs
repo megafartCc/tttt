@@ -40,7 +40,6 @@ namespace RBX_Alt_Manager
             this.customURLJSToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.Remove = new System.Windows.Forms.Button();
             this.JoinServer = new System.Windows.Forms.Button();
-            this.KillAllInstances = new System.Windows.Forms.Button();
             this.SetDescription = new System.Windows.Forms.Button();
             this.SetAlias = new System.Windows.Forms.Button();
             this.Follow = new System.Windows.Forms.Button();
@@ -70,6 +69,7 @@ namespace RBX_Alt_Manager
             this.copySecurityTokenToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.copyRbxplayerLinkToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.copyAppLinkToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
+            this.SelectionStatusLabel = new System.Windows.Forms.Label();
             this.HideUsernamesCheckbox = new System.Windows.Forms.CheckBox();
             this.BrowserButton = new System.Windows.Forms.Button();
             this.ArgumentsB = new System.Windows.Forms.Button();
@@ -196,22 +196,11 @@ namespace RBX_Alt_Manager
             this.JoinServer.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right)));
             this.JoinServer.Location = new System.Drawing.Point(503, 67);
             this.JoinServer.Name = "JoinServer";
-            this.JoinServer.Size = new System.Drawing.Size(130, 23);
+            this.JoinServer.Size = new System.Drawing.Size(198, 23);
             this.JoinServer.TabIndex = 4;
             this.JoinServer.Text = "Join Server";
             this.JoinServer.UseVisualStyleBackColor = true;
             this.JoinServer.Click += new System.EventHandler(this.JoinServer_Click);
-            // 
-            // KillAllInstances
-            // 
-            this.KillAllInstances.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right)));
-            this.KillAllInstances.Location = new System.Drawing.Point(639, 67);
-            this.KillAllInstances.Name = "KillAllInstances";
-            this.KillAllInstances.Size = new System.Drawing.Size(62, 23);
-            this.KillAllInstances.TabIndex = 5;
-            this.KillAllInstances.Text = "Kill All";
-            this.KillAllInstances.UseVisualStyleBackColor = true;
-            this.KillAllInstances.Click += new System.EventHandler(this.KillAllInstances_Click);
             // 
             // SetDescription
             // 
@@ -459,6 +448,16 @@ namespace RBX_Alt_Manager
             this.copyAppLinkToolStripMenuItem.Text = "Copy App Link";
             this.copyAppLinkToolStripMenuItem.Click += new System.EventHandler(this.copyAppLinkToolStripMenuItem_Click);
             // 
+            // SelectionStatusLabel
+            // 
+            this.SelectionStatusLabel.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Bottom | System.Windows.Forms.AnchorStyles.Left)));
+            this.SelectionStatusLabel.AutoSize = true;
+            this.SelectionStatusLabel.Location = new System.Drawing.Point(13, 250);
+            this.SelectionStatusLabel.Name = "SelectionStatusLabel";
+            this.SelectionStatusLabel.Size = new System.Drawing.Size(76, 13);
+            this.SelectionStatusLabel.TabIndex = 1006;
+            this.SelectionStatusLabel.Text = "Selected: 0/0";
+            // 
             // HideUsernamesCheckbox
             // 
             this.HideUsernamesCheckbox.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Bottom | System.Windows.Forms.AnchorStyles.Left)));
@@ -683,6 +682,7 @@ namespace RBX_Alt_Manager
             this.AccountsView.IsSimpleDragSource = true;
             this.AccountsView.IsSimpleDropSink = true;
             this.AccountsView.Location = new System.Drawing.Point(13, 13);
+            this.AccountsView.MultiSelect = true;
             this.AccountsView.Name = "AccountsView";
             this.AccountsView.ShowSortIndicators = false;
             this.AccountsView.Size = new System.Drawing.Size(485, 246);
@@ -1082,9 +1082,9 @@ namespace RBX_Alt_Manager
             this.Controls.Add(this.CurrentPlace);
             this.Controls.Add(this.ArgumentsB);
             this.Controls.Add(this.BrowserButton);
+            this.Controls.Add(this.SelectionStatusLabel);
             this.Controls.Add(this.HideUsernamesCheckbox);
             this.Controls.Add(this.ServerList);
-            this.Controls.Add(this.KillAllInstances);
             this.Controls.Add(this.LabelUserID);
             this.Controls.Add(this.UserID);
             this.Controls.Add(this.Follow);
@@ -1134,7 +1134,6 @@ namespace RBX_Alt_Manager
         private MenuButton Add;
         private System.Windows.Forms.Button Remove;
         private System.Windows.Forms.Button JoinServer;
-        private System.Windows.Forms.Button KillAllInstances;
         private System.Windows.Forms.Button SetDescription;
         private Classes.BorderedRichTextBox DescriptionBox;
         private System.Windows.Forms.Button SetAlias;
@@ -1147,6 +1146,7 @@ namespace RBX_Alt_Manager
         private System.Windows.Forms.ToolStripMenuItem addAccountsToolStripMenuItem;
         private System.Windows.Forms.ToolStripMenuItem removeAccountToolStripMenuItem;
         private System.Windows.Forms.ToolStripMenuItem infoToolStripMenuItem;
+        private System.Windows.Forms.Label SelectionStatusLabel;
         private System.Windows.Forms.CheckBox HideUsernamesCheckbox;
         private System.Windows.Forms.ToolStripMenuItem getAuthenticationTicketToolStripMenuItem;
         private System.Windows.Forms.ToolStripMenuItem copyRbxplayerLinkToolStripMenuItem;

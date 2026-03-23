@@ -10,6 +10,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Web;
@@ -40,16 +41,42 @@ namespace RBX_Alt_Manager
         [JsonIgnore] public long? CurrentPlaceId;
         [JsonIgnore] public string CurrentGameName = string.Empty;
         [JsonIgnore] public DateTime LastLiveStatusUpdateUtc = DateTime.MinValue;
+        [JsonIgnore] public int CurrentProcessId;
 
         [DllImport("user32.dll", SetLastError = true)]
         static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
+        [DllImport("user32.dll", SetLastError = true)]
+        static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
         [DllImport("psapi.dll", SetLastError = true)]
         static extern bool EmptyWorkingSet(IntPtr hProcess);
 
         private const int TinyLaunchPosX = 0;
         private const int TinyLaunchPosY = 0;
-        private const int TinyLaunchWidth = 220;
-        private const int TinyLaunchHeight = 140;
+        private const int TinyLaunchWidth = 160;
+        private const int TinyLaunchHeight = 90;
+        private const int SW_MINIMIZE = 6;
+
+        private static int GetSecureRandomNumber(int minInclusive, int maxExclusive)
+        {
+            if (minInclusive >= maxExclusive)
+                return minInclusive;
+
+            byte[] bytes = new byte[4];
+            uint range = (uint)(maxExclusive - minInclusive);
+            uint limit = uint.MaxValue - (uint.MaxValue % range);
+            uint value;
+
+            using (RandomNumberGenerator generator = RandomNumberGenerator.Create())
+            {
+                do
+                {
+                    generator.GetBytes(bytes);
+                    value = BitConverter.ToUInt32(bytes, 0);
+                } while (value >= limit);
+            }
+
+            return (int)(minInclusive + (value % range));
+        }
 
         public int CompareTo(Account compareTo)
         {
@@ -526,9 +553,16 @@ namespace RBX_Alt_Manager
         {
             if (string.IsNullOrEmpty(BrowserTrackerID))
             {
-                Random r = new Random();
+                string trackerId = string.Empty;
+                int attempts = 0;
 
-                BrowserTrackerID = r.Next(100000, 175000).ToString() + r.Next(100000, 900000).ToString(); // oh god this is ugly
+                do
+                {
+                    trackerId = GetSecureRandomNumber(100000, 175000).ToString() + GetSecureRandomNumber(100000, 900000).ToString();
+                    attempts++;
+                } while (attempts < 5 && AccountManager.AccountsList?.Any(account => account != this && string.Equals(account.BrowserTrackerID, trackerId, StringComparison.Ordinal)) == true);
+
+                BrowserTrackerID = trackerId; // Persisted through normal SaveAccounts flow later.
             }
 
             try { ClientSettingsPatcher.PatchSettings(); } catch (Exception Ex) { Program.Logger.Error($"Failed to patch ClientAppSettings: {Ex}"); }
@@ -709,21 +743,10 @@ namespace RBX_Alt_Manager
 
         public async void AdjustWindowPosition()
         {
-            int SavedPosX = 0;
-            int SavedPosY = 0;
-            int SavedWidth = 0;
-            int SavedHeight = 0;
-
-            bool HasSavedWindowPosition = RobloxWatcher.RememberWindowPositions
-                && int.TryParse(GetField("Window_Position_X"), out SavedPosX)
-                && int.TryParse(GetField("Window_Position_Y"), out SavedPosY)
-                && int.TryParse(GetField("Window_Width"), out SavedWidth)
-                && int.TryParse(GetField("Window_Height"), out SavedHeight);
-
-            int PosX = HasSavedWindowPosition ? SavedPosX : TinyLaunchPosX;
-            int PosY = HasSavedWindowPosition ? SavedPosY : TinyLaunchPosY;
-            int Width = HasSavedWindowPosition ? SavedWidth : TinyLaunchWidth;
-            int Height = HasSavedWindowPosition ? SavedHeight : TinyLaunchHeight;
+            int PosX = TinyLaunchPosX;
+            int PosY = TinyLaunchPosY;
+            int Width = TinyLaunchWidth;
+            int Height = TinyLaunchHeight;
 
             bool Found = false;
             DateTime Ends = DateTime.Now.AddSeconds(45);
@@ -736,7 +759,7 @@ namespace RBX_Alt_Manager
                 {
                     if (process.MainWindowHandle == IntPtr.Zero) continue;
 
-                    string CommandLine = process.GetCommandLine() ?? string.Empty;
+                    string CommandLine = process.GetCommandLine();
 
                     var TrackerMatch = Regex.Match(CommandLine, @"\-b (\d+)");
                     string TrackerID = TrackerMatch.Success ? TrackerMatch.Groups[1].Value : string.Empty;
@@ -749,24 +772,7 @@ namespace RBX_Alt_Manager
                     {
                         if (!process.HasExited)
                         {
-                            try
-                            {
-                                process.PriorityBoostEnabled = false;
-                            }
-                            catch { }
-
-                            try
-                            {
-                                process.PriorityClass = ProcessPriorityClass.Idle;
-                            }
-                            catch
-                            {
-                                try
-                                {
-                                    process.PriorityClass = ProcessPriorityClass.BelowNormal;
-                                }
-                                catch { }
-                            }
+                            try { AccountManager.Instance?.ApplyRobloxProcessOptimization(process); } catch { }
 
                             try
                             {
@@ -778,6 +784,21 @@ namespace RBX_Alt_Manager
                     catch { }
 
                     MoveWindow(process.MainWindowHandle, PosX, PosY, Width, Height, true);
+                    ShowWindow(process.MainWindowHandle, SW_MINIMIZE);
+
+                    try
+                    {
+                        process.PriorityBoostEnabled = false;
+                        if (process.PriorityClass != ProcessPriorityClass.BelowNormal)
+                            process.PriorityClass = ProcessPriorityClass.BelowNormal;
+                    }
+                    catch { }
+
+                    try
+                    {
+                        EmptyWorkingSet(process.Handle);
+                    }
+                    catch { }
 
                     break;
                 }
