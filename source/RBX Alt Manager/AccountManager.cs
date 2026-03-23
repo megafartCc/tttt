@@ -3260,68 +3260,81 @@ namespace RBX_Alt_Manager
             Account SingleTarget = LaunchTargets.Count == 1 ? LaunchTargets[0] : null;
             string JoinJobId = VIPServer ? JobID.Text.Substring(4) : JobID.Text;
 
-            new Thread(async () => // finally fixing an ancient bug in a dumb way, p.s. i do not condone this.
+            _ = Task.Run(async () => // Run launch worker on thread-pool with hard exception guard to avoid process-killing async-void crashes.
             {
-                if (LaunchMultiple)
+                try
                 {
-                    if (!EnsureMultiRobloxForBulkLaunch())
-                        Program.Logger.Warn("[BulkLaunch] Multi Roblox prep failed in pre-check; continuing with best-effort launch.");
+                    if (LaunchMultiple)
+                    {
+                        if (!EnsureMultiRobloxForBulkLaunch())
+                            Program.Logger.Warn("[BulkLaunch] Multi Roblox prep failed in pre-check; continuing with best-effort launch.");
 
-                    LauncherToken = new CancellationTokenSource();
+                        LauncherToken = new CancellationTokenSource();
+                        await LaunchAccounts(LaunchTargets, PlaceId, JoinJobId, false, VIPServer);
+                    }
+                    else if (SingleTarget != null)
+                    {
+                        string res = await JoinWithFailureRecovery(SingleTarget, PlaceId, JoinJobId, false, VIPServer, "JoinServer");
 
-                    await LaunchAccounts(LaunchTargets, PlaceId, JoinJobId, false, VIPServer);
+                        if (!IsJoinSuccess(res))
+                            this.InvokeIfRequired(() => MessageBox.Show(res));
+                    }
                 }
-                else if (SingleTarget != null)
+                catch (Exception x)
                 {
-                    string res = await JoinWithFailureRecovery(SingleTarget, PlaceId, JoinJobId, false, VIPServer, "JoinServer");
-
-                    if (!IsJoinSuccess(res))
-                        MessageBox.Show(res);
+                    Program.Logger.Error($"[JoinServer] Unhandled launch worker error: {x}");
                 }
-            }).Start();
+            });
         }
 
         private async void Follow_Click(object sender, EventArgs e)
         {
-            if (!GetUserID(UserID.Text, out long UserId, out var Response))
+            try
             {
-                MessageBox.Show($"[{Response.StatusCode} {Response.StatusDescription}] Failed to get UserId: {Response.Content}");
-                return;
-            }
-    
-            if (!(await Presence.GetPresenceSingular(UserId) is UserPresence Status && Status.userPresenceType == UserPresenceType.InGame && Status.placeId is long FollowPlaceID && FollowPlaceID > 0) &&
-                !Utilities.YesNoPrompt("Warning", "The user you are trying to follow is not in game or has their joins off", "Do you want to attempt to join anyways?")) return;
-
-            CancelLaunching();
-
-            List<Account> LaunchTargets = GetLaunchTargetsSnapshot();
-            if (LaunchTargets.Count == 0)
-            {
-                MessageBox.Show("Select at least one account to launch.", "Roblox Account Manager", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
-
-            bool LaunchMultiple = LaunchTargets.Count > 1;
-            Account SingleTarget = LaunchTargets.Count == 1 ? LaunchTargets[0] : null;
-
-            if (LaunchMultiple)
-            {
-                LauncherToken = new CancellationTokenSource();
-
-                await Task.Run(async () =>
+                if (!GetUserID(UserID.Text, out long UserId, out var Response))
                 {
-                    if (!EnsureMultiRobloxForBulkLaunch())
-                        Program.Logger.Warn("[FollowLaunch] Multi Roblox prep failed in pre-check; continuing with best-effort launch.");
+                    MessageBox.Show($"[{Response.StatusCode} {Response.StatusDescription}] Failed to get UserId: {Response.Content}");
+                    return;
+                }
 
-                    await LaunchAccounts(LaunchTargets, UserId, "", true);
-                });
+                if (!(await Presence.GetPresenceSingular(UserId) is UserPresence Status && Status.userPresenceType == UserPresenceType.InGame && Status.placeId is long FollowPlaceID && FollowPlaceID > 0) &&
+                    !Utilities.YesNoPrompt("Warning", "The user you are trying to follow is not in game or has their joins off", "Do you want to attempt to join anyways?")) return;
+
+                CancelLaunching();
+
+                List<Account> LaunchTargets = GetLaunchTargetsSnapshot();
+                if (LaunchTargets.Count == 0)
+                {
+                    MessageBox.Show("Select at least one account to launch.", "Roblox Account Manager", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                bool LaunchMultiple = LaunchTargets.Count > 1;
+                Account SingleTarget = LaunchTargets.Count == 1 ? LaunchTargets[0] : null;
+
+                if (LaunchMultiple)
+                {
+                    LauncherToken = new CancellationTokenSource();
+
+                    await Task.Run(async () =>
+                    {
+                        if (!EnsureMultiRobloxForBulkLaunch())
+                            Program.Logger.Warn("[FollowLaunch] Multi Roblox prep failed in pre-check; continuing with best-effort launch.");
+
+                        await LaunchAccounts(LaunchTargets, UserId, "", true);
+                    });
+                }
+                else if (SingleTarget != null)
+                {
+                    string res = await JoinWithFailureRecovery(SingleTarget, UserId, "", true, false, "FollowJoin");
+
+                    if (!IsJoinSuccess(res))
+                        MessageBox.Show(res);
+                }
             }
-            else if (SingleTarget != null)
+            catch (Exception x)
             {
-                string res = await JoinWithFailureRecovery(SingleTarget, UserId, "", true, false, "FollowJoin");
-
-                if (!IsJoinSuccess(res))
-                    MessageBox.Show(res);
+                Program.Logger.Error($"[Follow_Click] Unhandled error: {x}");
             }
         }
 

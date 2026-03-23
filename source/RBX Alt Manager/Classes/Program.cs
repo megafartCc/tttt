@@ -25,6 +25,8 @@ namespace RBX_Alt_Manager
         public static readonly ILog Logger = LogManager.GetLogger("Account Manager");
         public static bool Closed = false; // RobloxProcess.cs would cause the program to chill in the background as long roblox was also running
         public static bool Elevated;
+        private static readonly object CrashLogLock = new object();
+        private static int ThreadExceptionCount;
         public static float Scale
         {
             get
@@ -107,6 +109,37 @@ namespace RBX_Alt_Manager
             }
 
             Application.ApplicationExit += (s, e) => Closed = true;
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            Application.ThreadException += (s, e) =>
+            {
+                LogUnhandledException("UI thread", e.Exception, false);
+
+                int count = Interlocked.Increment(ref ThreadExceptionCount);
+                if (count <= 3)
+                {
+                    try
+                    {
+                        MessageBox.Show(
+                            "RAMV2 caught an unexpected UI error and recovered.\n\nPlease keep this window open and send your latest log/crash file if this keeps happening.",
+                            "Roblox Account Manager",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Warning);
+                    }
+                    catch { }
+                }
+            };
+
+            AppDomain.CurrentDomain.UnhandledException += (s, e) =>
+            {
+                Exception ex = e.ExceptionObject as Exception ?? new Exception(e.ExceptionObject?.ToString() ?? "Unknown unhandled exception");
+                LogUnhandledException("AppDomain", ex, e.IsTerminating);
+            };
+
+            TaskScheduler.UnobservedTaskException += (s, e) =>
+            {
+                LogUnhandledException("TaskScheduler", e.Exception, false);
+                e.SetObserved();
+            };
 
             if (!File.Exists(Path.Combine(Environment.CurrentDirectory, "RAMTheme.ini")))
                 File.WriteAllText(Path.Combine(Environment.CurrentDirectory, "RAMTheme.ini"), Resources.DefaultTheme);
@@ -182,6 +215,29 @@ namespace RBX_Alt_Manager
             else
                 MessageBox.Show("Roblox Account Manager is already running!", "Roblox Account Manager", MessageBoxButtons.OK, MessageBoxIcon.Error);
 #endif
+        }
+
+        private static void LogUnhandledException(string source, Exception exception, bool terminating)
+        {
+            try
+            {
+                Logger.Error($"[Unhandled:{source}] terminating={terminating} | {exception}");
+            }
+            catch { }
+
+            try
+            {
+                string dataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Roblox Account Manager");
+                Directory.CreateDirectory(dataDir);
+                string crashPath = Path.Combine(dataDir, "crash.log");
+                string payload =
+                    $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] source={source} terminating={terminating}{Environment.NewLine}" +
+                    $"{exception}{Environment.NewLine}{Environment.NewLine}";
+
+                lock (CrashLogLock)
+                    File.AppendAllText(crashPath, payload);
+            }
+            catch { }
         }
     }
 }
