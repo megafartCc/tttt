@@ -114,8 +114,9 @@ namespace RBX_Alt_Manager
         private static readonly TimeSpan AutoRejoinOfflineThreshold = TimeSpan.FromSeconds(105);
         private static readonly TimeSpan AutoRejoinRetryCooldown = TimeSpan.FromSeconds(30);
         private static readonly TimeSpan AutoRejoinRelaunchTimeout = TimeSpan.FromSeconds(75);
+        private static readonly TimeSpan AutoRejoinMissingPidGrace = TimeSpan.FromSeconds(5);
         private readonly ConcurrentDictionary<string, AutoRejoinState> AutoRejoinStates = new ConcurrentDictionary<string, AutoRejoinState>();
-        private readonly ConcurrentDictionary<string, byte> AutoRejoinInProgress = new ConcurrentDictionary<string, byte>();
+        private readonly ConcurrentDictionary<string, DateTime> AutoRejoinInProgress = new ConcurrentDictionary<string, DateTime>();
         private readonly ConcurrentDictionary<string, ServerClaimState> ScriptServerClaims = new ConcurrentDictionary<string, ServerClaimState>();
         private readonly object ScriptServerClaimsLock = new object();
         private static readonly TimeSpan ScriptServerClaimMinLease = TimeSpan.FromSeconds(10);
@@ -140,6 +141,7 @@ namespace RBX_Alt_Manager
         {
             public bool HasSeenActiveSession { get; set; }
             public DateTime? OfflineSinceUtc { get; set; }
+            public DateTime? MissingPidSinceUtc { get; set; }
             public DateTime LastAttemptUtc { get; set; } = DateTime.MinValue;
         }
 
@@ -413,6 +415,27 @@ namespace RBX_Alt_Manager
             return $"{Math.Max(0, (int)Remaining.TotalHours)}h {Math.Max(0, Remaining.Minutes)}m";
         }
 
+        private bool IsAutoRejoinLaunchInProgress(string rejoinKey, Account account, DateTime nowUtc, DateTime? lastSignalUtc)
+        {
+            if (string.IsNullOrEmpty(rejoinKey))
+                return false;
+
+            if (!AutoRejoinInProgress.TryGetValue(rejoinKey, out DateTime launchStartedUtc))
+                return false;
+
+            bool HasKnownProcess = account?.CurrentProcessId > 0;
+            bool HasFreshSignal = lastSignalUtc.HasValue && (nowUtc - lastSignalUtc.Value) <= TimeSpan.FromSeconds(10);
+            bool TimedOut = (nowUtc - launchStartedUtc) > (AutoRejoinRelaunchTimeout + TimeSpan.FromSeconds(10));
+
+            if (HasKnownProcess || HasFreshSignal || TimedOut)
+            {
+                AutoRejoinInProgress.TryRemove(rejoinKey, out _);
+                return false;
+            }
+
+            return true;
+        }
+
         private string GetAutoRejoinCountdownText(Account account, DateTime nowUtc)
         {
             if (account == null || General == null || !General.Get<bool>("AutoRejoin"))
@@ -423,6 +446,27 @@ namespace RBX_Alt_Manager
                 return string.Empty;
 
             DateTime? LastSignalUtc = account.LastLiveStatusUpdateUtc != DateTime.MinValue ? account.LastLiveStatusUpdateUtc : (DateTime?)null;
+            bool HasKnownProcess = account.CurrentProcessId > 0;
+
+            if (IsAutoRejoinLaunchInProgress(RejoinKey, account, nowUtc, LastSignalUtc))
+                return "restarting...";
+
+            if (!HasKnownProcess)
+            {
+                DateTime MissingPidSinceUtc = nowUtc;
+                if (AutoRejoinStates.TryGetValue(RejoinKey, out AutoRejoinState MissingState) && MissingState?.MissingPidSinceUtc.HasValue == true)
+                    MissingPidSinceUtc = MissingState.MissingPidSinceUtc.Value;
+
+                TimeSpan MissingPidDuration = nowUtc - MissingPidSinceUtc;
+                if (MissingPidDuration < TimeSpan.Zero)
+                    MissingPidDuration = TimeSpan.Zero;
+
+                TimeSpan MissingPidRemaining = AutoRejoinMissingPidGrace - MissingPidDuration;
+                if (MissingPidRemaining <= TimeSpan.Zero)
+                    return "restart due (no pid)";
+
+                return $"restart in {FormatCountdown(MissingPidRemaining)} (no pid)";
+            }
 
             DateTime OfflineSinceUtc = nowUtc;
             if (AutoRejoinStates.TryGetValue(RejoinKey, out AutoRejoinState state) && state?.OfflineSinceUtc.HasValue == true)
@@ -433,9 +477,6 @@ namespace RBX_Alt_Manager
             TimeSpan OfflineDuration = nowUtc - OfflineSinceUtc;
             if (OfflineDuration < TimeSpan.Zero)
                 OfflineDuration = TimeSpan.Zero;
-
-            if (AutoRejoinInProgress.ContainsKey(RejoinKey))
-                return "restarting...";
 
             TimeSpan Remaining = AutoRejoinOfflineThreshold - OfflineDuration;
             if (Remaining <= TimeSpan.Zero)
@@ -1731,11 +1772,23 @@ namespace RBX_Alt_Manager
                 bool SignalStale = LastSignalUtc.HasValue && !HasFreshSignal;
                 bool MissingSignal = !LastSignalUtc.HasValue;
 
+                if (IsAutoRejoinLaunchInProgress(RejoinKey, account, NowUtc, LastSignalUtc))
+                    continue;
+
                 // Auto Rejoin applies to all listed accounts when enabled, even if no signal was seen yet.
                 State.HasSeenActiveSession = true;
 
-                // Any fresh signal means the instance is alive; do not run rejoin timer.
-                if (HasFreshSignal)
+                if (HasKnownProcess)
+                    State.MissingPidSinceUtc = null;
+                else if (!State.MissingPidSinceUtc.HasValue || State.MissingPidSinceUtc.Value > NowUtc)
+                    State.MissingPidSinceUtc = NowUtc;
+
+                bool MissingPidDue = !HasKnownProcess
+                    && State.MissingPidSinceUtc.HasValue
+                    && (NowUtc - State.MissingPidSinceUtc.Value) >= AutoRejoinMissingPidGrace;
+
+                // Fresh signal + known PID means session is alive; no rejoin timer.
+                if (HasFreshSignal && HasKnownProcess)
                 {
                     State.OfflineSinceUtc = null;
                     continue;
@@ -1744,18 +1797,20 @@ namespace RBX_Alt_Manager
                 if (!State.OfflineSinceUtc.HasValue)
                     State.OfflineSinceUtc = LastSignalUtc.HasValue && LastSignalUtc.Value <= NowUtc ? LastSignalUtc.Value : NowUtc;
 
-                if ((NowUtc - State.OfflineSinceUtc.Value) < AutoRejoinOfflineThreshold)
+                bool OfflineDue = (NowUtc - State.OfflineSinceUtc.Value) >= AutoRejoinOfflineThreshold;
+                if (!MissingPidDue && !OfflineDue)
                     continue;
 
                 if ((NowUtc - State.LastAttemptUtc) < AutoRejoinRetryCooldown)
                     continue;
 
-                if (!AutoRejoinInProgress.TryAdd(RejoinKey, 0))
+                if (!AutoRejoinInProgress.TryAdd(RejoinKey, NowUtc))
                     continue;
 
                 State.LastAttemptUtc = NowUtc;
 
-                Program.Logger.Info($"[AutoRejoin] Watchdog trigger for {account.Username}: key={RejoinKey}, pid={account.CurrentProcessId}, lastSignal={(LastSignalUtc.HasValue ? LastSignalUtc.Value.ToString("o") : "none")}, open={account.HasOpenInstance}, inGame={InGame}, stale={SignalStale}, missingSignal={MissingSignal}, managed={ManagedAccount}");
+                string reason = MissingPidDue ? "missing_pid" : "stale_or_missing_signal";
+                Program.Logger.Info($"[AutoRejoin] Watchdog trigger for {account.Username}: reason={reason}, key={RejoinKey}, pid={account.CurrentProcessId}, lastSignal={(LastSignalUtc.HasValue ? LastSignalUtc.Value.ToString("o") : "none")}, open={account.HasOpenInstance}, inGame={InGame}, stale={SignalStale}, missingSignal={MissingSignal}, managed={ManagedAccount}");
                 _ = RelaunchForAutoRejoinWithTimeout(account, RejoinKey);
             }
 
