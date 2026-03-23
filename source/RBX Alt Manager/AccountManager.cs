@@ -682,6 +682,7 @@ namespace RBX_Alt_Manager
         {
             List<Account> byObjects = new List<Account>();
             List<Account> byIndices = new List<Account>();
+            List<Account> byItems = new List<Account>();
 
             try { byObjects = DistinctAccounts(AccountsView.SelectedObjects.Cast<Account>()); } catch { }
 
@@ -697,10 +698,20 @@ namespace RBX_Alt_Manager
             }
             catch { }
 
-            if (byIndices.Count > 0)
-                return byIndices;
+            try
+            {
+                foreach (OLVListItem item in AccountsView.SelectedItems)
+                {
+                    if (item?.RowObject is Account account)
+                        byItems.Add(account);
+                }
 
-            return byObjects;
+                byItems = DistinctAccounts(byItems);
+            }
+            catch { }
+
+            // Use the union so focused-row edge cases can't collapse multiselect to one account.
+            return DistinctAccounts(byObjects.Concat(byIndices).Concat(byItems));
         }
 
         private List<Account> GetLaunchTargetsSnapshot()
@@ -3243,6 +3254,8 @@ namespace RBX_Alt_Manager
                 return;
             }
 
+            Program.Logger.Info($"[BulkLaunch] JoinServer click selection resolved to {LaunchTargets.Count}: {string.Join(", ", LaunchTargets.Select(account => account?.Username ?? "unknown"))}");
+
             bool LaunchMultiple = LaunchTargets.Count > 1;
             Account SingleTarget = LaunchTargets.Count == 1 ? LaunchTargets[0] : null;
             string JoinJobId = VIPServer ? JobID.Text.Substring(4) : JobID.Text;
@@ -3843,6 +3856,8 @@ namespace RBX_Alt_Manager
 
             if (MultiLaunch)
                 AsyncJoin = false; // Always run selected multi-launch as strict queue.
+
+            Program.Logger.Info($"[BulkLaunch] Queue size {LaunchQueue.Count}: {string.Join(", ", LaunchQueue.Select(account => account?.Username ?? "unknown"))}");
 
             NormalizeBrowserTrackerIds();
 
