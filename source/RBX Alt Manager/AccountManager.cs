@@ -21,6 +21,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -112,8 +113,8 @@ namespace RBX_Alt_Manager
         private const long AutoRejoinPlaceId = 109983668079237;
         private static readonly TimeSpan AutoRejoinOfflineThreshold = TimeSpan.FromSeconds(105);
         private static readonly TimeSpan AutoRejoinRetryCooldown = TimeSpan.FromSeconds(30);
-        private readonly ConcurrentDictionary<long, AutoRejoinState> AutoRejoinStates = new ConcurrentDictionary<long, AutoRejoinState>();
-        private readonly ConcurrentDictionary<long, byte> AutoRejoinInProgress = new ConcurrentDictionary<long, byte>();
+        private readonly ConcurrentDictionary<string, AutoRejoinState> AutoRejoinStates = new ConcurrentDictionary<string, AutoRejoinState>();
+        private readonly ConcurrentDictionary<string, byte> AutoRejoinInProgress = new ConcurrentDictionary<string, byte>();
         private readonly ConcurrentDictionary<string, ServerClaimState> ScriptServerClaims = new ConcurrentDictionary<string, ServerClaimState>();
         private readonly object ScriptServerClaimsLock = new object();
         private static readonly TimeSpan ScriptServerClaimMinLease = TimeSpan.FromSeconds(10);
@@ -139,6 +140,33 @@ namespace RBX_Alt_Manager
             public bool HasSeenActiveSession { get; set; }
             public DateTime? OfflineSinceUtc { get; set; }
             public DateTime LastAttemptUtc { get; set; } = DateTime.MinValue;
+        }
+
+        private static string NormalizeAutoRejoinKeyPart(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return string.Empty;
+
+            return value.Trim().ToLowerInvariant();
+        }
+
+        private static string GetAutoRejoinAccountKey(Account account)
+        {
+            if (account == null)
+                return string.Empty;
+
+            string UsernamePart = NormalizeAutoRejoinKeyPart(account.Username);
+            if (account.UserID > 0)
+                return string.IsNullOrEmpty(UsernamePart) ? $"uid:{account.UserID}" : $"uid:{account.UserID}|usr:{UsernamePart}";
+
+            if (!string.IsNullOrEmpty(UsernamePart))
+                return $"usr:{UsernamePart}";
+
+            string TrackerPart = NormalizeAutoRejoinKeyPart(account.BrowserTrackerID);
+            if (!string.IsNullOrEmpty(TrackerPart))
+                return $"trk:{TrackerPart}";
+
+            return $"mem:{RuntimeHelpers.GetHashCode(account)}";
         }
 
         private sealed class ServerClaimState
@@ -373,9 +401,12 @@ namespace RBX_Alt_Manager
             if (account == null) return string.Empty;
             if (account.LastLiveStatusUpdateUtc == DateTime.MinValue)
             {
+                string RejoinKey = GetAutoRejoinAccountKey(account);
+
                 if (General != null
                     && General.Get<bool>("AutoRejoin")
-                    && AutoRejoinStates.TryGetValue(account.UserID, out AutoRejoinState state)
+                    && !string.IsNullOrEmpty(RejoinKey)
+                    && AutoRejoinStates.TryGetValue(RejoinKey, out AutoRejoinState state)
                     && state?.OfflineSinceUtc.HasValue == true)
                 {
                     return $"No signal ({FormatLastSeenAge(state.OfflineSinceUtc.Value)})";
@@ -1351,24 +1382,125 @@ namespace RBX_Alt_Manager
             return ScriptInGame || PresenceInGame;
         }
 
-        private async Task<bool> TryCloseAutoRejoinProcess(Process process)
+        private static bool LooksLikeRobloxClientProcess(Process process)
         {
-            if (process == null)
+            try
+            {
+                if (process == null || process.HasExited)
+                    return false;
+
+                string Name = process.ProcessName ?? string.Empty;
+                return Name.IndexOf("Roblox", StringComparison.OrdinalIgnoreCase) >= 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private int ResolveAccountProcessIdForAutoRejoin(Account account)
+        {
+            if (account == null)
+                return 0;
+
+            if (account.CurrentProcessId > 0)
+            {
+                try
+                {
+                    using (Process process = Process.GetProcessById(account.CurrentProcessId))
+                    {
+                        if (LooksLikeRobloxClientProcess(process))
+                            return process.Id;
+                    }
+                }
+                catch { }
+            }
+
+            if (!string.IsNullOrEmpty(account.BrowserTrackerID))
+            {
+                foreach (Process process in Process.GetProcessesByName("RobloxPlayerBeta"))
+                {
+                    try
+                    {
+                        if (process.HasExited)
+                            continue;
+
+                        string CommandLine = process.GetCommandLine() ?? string.Empty;
+                        Match TrackerMatch = BrowserTrackerRegex.Match(CommandLine);
+                        string TrackerID = TrackerMatch.Success ? TrackerMatch.Groups[1].Value : string.Empty;
+
+                        if (!string.Equals(TrackerID, account.BrowserTrackerID, StringComparison.Ordinal))
+                            continue;
+
+                        return process.Id;
+                    }
+                    catch { }
+                    finally { process.Dispose(); }
+                }
+            }
+
+            return 0;
+        }
+
+        private async Task<bool> TryTerminatePidForAutoRejoin(int pid)
+        {
+            if (pid <= 0)
                 return false;
 
             try
             {
-                if (process.HasExited)
-                    return true;
+                using (Process process = Process.GetProcessById(pid))
+                {
+                    if (process.HasExited)
+                        return true;
 
-                process.CloseMainWindow();
-                await Task.Delay(250);
-                process.CloseMainWindow();
-                await Task.Delay(250);
+                    try { process.CloseMainWindow(); } catch { }
+                    await Task.Delay(200);
 
-                if (!process.HasExited)
-                    process.Kill();
+                    if (!process.HasExited)
+                    {
+                        try { process.Kill(); } catch { }
+                    }
 
+                    try
+                    {
+                        if (process.WaitForExit(4000))
+                            return true;
+                    }
+                    catch { }
+                }
+            }
+            catch (ArgumentException)
+            {
+                return true;
+            }
+            catch { }
+
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("taskkill", $"/PID {pid} /F /T")
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+
+                using (Process taskkill = Process.Start(psi))
+                {
+                    if (taskkill != null)
+                        await Task.Run(() => taskkill.WaitForExit(5000));
+                }
+            }
+            catch { }
+
+            try
+            {
+                using (Process verify = Process.GetProcessById(pid))
+                    return verify.HasExited;
+            }
+            catch (ArgumentException)
+            {
                 return true;
             }
             catch
@@ -1385,39 +1517,51 @@ namespace RBX_Alt_Manager
 
             try
             {
-                if (account.CurrentProcessId > 0)
+                int ResolvedPid = ResolveAccountProcessIdForAutoRejoin(account);
+
+                if (ResolvedPid > 0)
                 {
-                    try
-                    {
-                        using (Process pidProcess = Process.GetProcessById(account.CurrentProcessId))
-                            ClosedAny = await TryCloseAutoRejoinProcess(pidProcess) || ClosedAny;
-                    }
-                    catch { }
+                    Program.Logger.Info($"[AutoRejoin] Terminating PID {ResolvedPid} for {account.Username}.");
+                    ClosedAny = await TryTerminatePidForAutoRejoin(ResolvedPid);
+
+                    if (!ClosedAny)
+                        Program.Logger.Warn($"[AutoRejoin] Failed to terminate PID {ResolvedPid} for {account.Username}.");
                 }
 
                 if (!ClosedAny && !string.IsNullOrEmpty(account.BrowserTrackerID))
                 {
-                    foreach (Process proc in Process.GetProcessesByName("RobloxPlayerBeta"))
+                    foreach (Process process in Process.GetProcessesByName("RobloxPlayerBeta"))
                     {
                         try
                         {
-                            string commandLine = proc.GetCommandLine() ?? string.Empty;
-                            Match TrackerMatch = BrowserTrackerRegex.Match(commandLine);
+                            if (process.HasExited)
+                                continue;
+
+                            string CommandLine = process.GetCommandLine() ?? string.Empty;
+                            Match TrackerMatch = BrowserTrackerRegex.Match(CommandLine);
                             string TrackerID = TrackerMatch.Success ? TrackerMatch.Groups[1].Value : string.Empty;
 
                             if (!string.Equals(TrackerID, account.BrowserTrackerID, StringComparison.Ordinal))
                                 continue;
 
-                            if (await TryCloseAutoRejoinProcess(proc))
+                            Program.Logger.Info($"[AutoRejoin] Fallback terminate PID {process.Id} for {account.Username} via tracker match.");
+                            if (await TryTerminatePidForAutoRejoin(process.Id))
+                            {
                                 ClosedAny = true;
+                                break;
+                            }
                         }
                         catch { }
-                        finally { proc.Dispose(); }
+                        finally { process.Dispose(); }
                     }
                 }
 
                 if (ClosedAny)
+                {
                     account.CurrentProcessId = 0;
+                    account.HasOpenInstance = false;
+                    account.IsOnServer = false;
+                }
             }
             catch (Exception x)
             {
@@ -1427,6 +1571,8 @@ namespace RBX_Alt_Manager
 
         private async Task RelaunchForAutoRejoin(Account account)
         {
+            string RejoinKey = GetAutoRejoinAccountKey(account);
+
             try
             {
                 if (Program.Closed || account == null) return;
@@ -1448,8 +1594,8 @@ namespace RBX_Alt_Manager
             }
             finally
             {
-                if (account != null)
-                    AutoRejoinInProgress.TryRemove(account.UserID, out _);
+                if (!string.IsNullOrEmpty(RejoinKey))
+                    AutoRejoinInProgress.TryRemove(RejoinKey, out _);
             }
         }
 
@@ -1467,15 +1613,19 @@ namespace RBX_Alt_Manager
 
             DateTime NowUtc = DateTime.UtcNow;
 
-            HashSet<long> ExistingAccounts = new HashSet<long>();
+            HashSet<string> ExistingAccounts = new HashSet<string>(StringComparer.Ordinal);
 
             foreach (Account account in AccountsList)
             {
                 if (account == null) continue;
 
-                ExistingAccounts.Add(account.UserID);
+                string RejoinKey = GetAutoRejoinAccountKey(account);
+                if (string.IsNullOrEmpty(RejoinKey))
+                    continue;
 
-                AutoRejoinState State = AutoRejoinStates.GetOrAdd(account.UserID, _ => new AutoRejoinState());
+                ExistingAccounts.Add(RejoinKey);
+
+                AutoRejoinState State = AutoRejoinStates.GetOrAdd(RejoinKey, _ => new AutoRejoinState());
                 bool InGame = IsAccountInGame(account);
                 DateTime? LastSignalUtc = account.LastLiveStatusUpdateUtc != DateTime.MinValue ? account.LastLiveStatusUpdateUtc : (DateTime?)null;
                 bool ManagedAccount = !string.IsNullOrEmpty(account.BrowserTrackerID);
@@ -1511,22 +1661,22 @@ namespace RBX_Alt_Manager
                 if ((NowUtc - State.LastAttemptUtc) < AutoRejoinRetryCooldown)
                     continue;
 
-                if (!AutoRejoinInProgress.TryAdd(account.UserID, 0))
+                if (!AutoRejoinInProgress.TryAdd(RejoinKey, 0))
                     continue;
 
                 State.LastAttemptUtc = NowUtc;
 
-                Program.Logger.Info($"[AutoRejoin] Watchdog trigger for {account.Username}: lastSignal={(LastSignalUtc.HasValue ? LastSignalUtc.Value.ToString("o") : "none")}, open={account.HasOpenInstance}, inGame={InGame}, stale={SignalStale}, missingSignal={MissingSignal}, managed={ManagedAccount}");
+                Program.Logger.Info($"[AutoRejoin] Watchdog trigger for {account.Username}: key={RejoinKey}, pid={account.CurrentProcessId}, lastSignal={(LastSignalUtc.HasValue ? LastSignalUtc.Value.ToString("o") : "none")}, open={account.HasOpenInstance}, inGame={InGame}, stale={SignalStale}, missingSignal={MissingSignal}, managed={ManagedAccount}");
                 _ = RelaunchForAutoRejoin(account);
             }
 
-            foreach (long UserId in AutoRejoinStates.Keys)
+            foreach (string Key in AutoRejoinStates.Keys)
             {
-                if (ExistingAccounts.Contains(UserId))
+                if (ExistingAccounts.Contains(Key))
                     continue;
 
-                AutoRejoinStates.TryRemove(UserId, out _);
-                AutoRejoinInProgress.TryRemove(UserId, out _);
+                AutoRejoinStates.TryRemove(Key, out _);
+                AutoRejoinInProgress.TryRemove(Key, out _);
             }
         }
 
