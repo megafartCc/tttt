@@ -3188,6 +3188,44 @@ namespace RBX_Alt_Manager
             ServerListForm.Left = Right;
         }
 
+        private async void KillAllInstances_Click(object sender, EventArgs e)
+        {
+            if (!Utilities.YesNoPrompt("Roblox Account Manager", "Kill all Roblox instances?", "This will force close all open Roblox clients immediately.", false))
+                return;
+
+            KillAllInstances.Enabled = false;
+
+            try
+            {
+                CancelLaunching();
+
+                await Task.Run(() => ForceStopAllRobloxProcessesForMultiPrep());
+
+                List<Account> AccountsSnapshot = AccountsList?.Where(account => account != null).ToList() ?? new List<Account>();
+                foreach (Account account in AccountsSnapshot)
+                {
+                    account.CurrentProcessId = 0;
+                    account.HasOpenInstance = false;
+                    account.IsOnServer = false;
+                }
+
+                AccountsView.InvokeIfRequired(() => AccountsView.RefreshObjects(AccountsSnapshot));
+
+                await TryUpdateLiveStatus(true);
+
+                Program.Logger.Info("[KillAll] User-triggered kill of all Roblox instances completed.");
+            }
+            catch (Exception x)
+            {
+                Program.Logger.Error($"[KillAll] Failed killing all Roblox instances: {x}");
+                MessageBox.Show($"Failed to kill all instances:\n{x.Message}", "Roblox Account Manager", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                KillAllInstances.Enabled = true;
+            }
+        }
+
         private void HideUsernamesCheckbox_CheckedChanged(object sender, EventArgs e)
         {
             General.Set("HideUsernames", HideUsernamesCheckbox.Checked ? "true" : "false");

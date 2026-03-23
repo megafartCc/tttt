@@ -45,6 +45,7 @@ namespace RBX_Alt_Manager
             this.Follow = new System.Windows.Forms.Button();
             this.LabelUserID = new System.Windows.Forms.Label();
             this.ServerList = new System.Windows.Forms.Button();
+            this.KillAllInstances = new System.Windows.Forms.Button();
             this.AccountsStrip = new System.Windows.Forms.ContextMenuStrip(this.components);
             this.addAccountsToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.removeAccountToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
@@ -196,7 +197,7 @@ namespace RBX_Alt_Manager
             this.JoinServer.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right)));
             this.JoinServer.Location = new System.Drawing.Point(503, 67);
             this.JoinServer.Name = "JoinServer";
-            this.JoinServer.Size = new System.Drawing.Size(198, 23);
+            this.JoinServer.Size = new System.Drawing.Size(133, 23);
             this.JoinServer.TabIndex = 4;
             this.JoinServer.Text = "Join Server";
             this.JoinServer.UseVisualStyleBackColor = true;
@@ -249,7 +250,7 @@ namespace RBX_Alt_Manager
             // ServerList
             // 
             this.ServerList.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right)));
-            this.ServerList.Location = new System.Drawing.Point(707, 67);
+            this.ServerList.Location = new System.Drawing.Point(639, 67);
             this.ServerList.Name = "ServerList";
             this.ServerList.Size = new System.Drawing.Size(65, 23);
             this.ServerList.TabIndex = 6;
@@ -257,6 +258,18 @@ namespace RBX_Alt_Manager
             this.SaveTooltip.SetToolTip(this.ServerList, "Contains Server List, Games List, and Favorites List");
             this.ServerList.UseVisualStyleBackColor = true;
             this.ServerList.Click += new System.EventHandler(this.ServerList_Click);
+            // 
+            // KillAllInstances
+            // 
+            this.KillAllInstances.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right)));
+            this.KillAllInstances.Location = new System.Drawing.Point(707, 67);
+            this.KillAllInstances.Name = "KillAllInstances";
+            this.KillAllInstances.Size = new System.Drawing.Size(65, 23);
+            this.KillAllInstances.TabIndex = 1007;
+            this.KillAllInstances.Text = "Kill All";
+            this.SaveTooltip.SetToolTip(this.KillAllInstances, "Force close all open Roblox instances.");
+            this.KillAllInstances.UseVisualStyleBackColor = true;
+            this.KillAllInstances.Click += new System.EventHandler(this.KillAllInstances_Click);
             // 
             // AccountsStrip
             // 
@@ -1084,6 +1097,7 @@ namespace RBX_Alt_Manager
             this.Controls.Add(this.BrowserButton);
             this.Controls.Add(this.SelectionStatusLabel);
             this.Controls.Add(this.HideUsernamesCheckbox);
+            this.Controls.Add(this.KillAllInstances);
             this.Controls.Add(this.ServerList);
             this.Controls.Add(this.LabelUserID);
             this.Controls.Add(this.UserID);
@@ -1142,6 +1156,7 @@ namespace RBX_Alt_Manager
         private Classes.BorderedTextBox UserID;
         private System.Windows.Forms.Label LabelUserID;
         private System.Windows.Forms.Button ServerList;
+        private System.Windows.Forms.Button KillAllInstances;
         private System.Windows.Forms.ContextMenuStrip AccountsStrip;
         private System.Windows.Forms.ToolStripMenuItem addAccountsToolStripMenuItem;
         private System.Windows.Forms.ToolStripMenuItem removeAccountToolStripMenuItem;
