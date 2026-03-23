@@ -795,13 +795,31 @@ namespace RBX_Alt_Manager
             int Height = TinyLaunchHeight;
 
             bool Found = false;
-            DateTime Ends = DateTime.Now.AddSeconds(45);
+            DateTime SearchEnds = DateTime.Now.AddSeconds(45);
+            DateTime EnforceEnds = DateTime.MinValue;
 
             while (true)
             {
                 await Task.Delay(350);
 
-                foreach (Process process in Process.GetProcessesByName("RobloxPlayerBeta").Reverse())
+                Process[] processSnapshot;
+                try { processSnapshot = Process.GetProcessesByName("RobloxPlayerBeta"); }
+                catch { processSnapshot = Array.Empty<Process>(); }
+
+                var orderedProcesses = processSnapshot
+                    .OrderByDescending(process =>
+                    {
+                        try { return process.StartTime; }
+                        catch { return DateTime.MinValue; }
+                    })
+                    .ToList();
+
+                bool allowSingleFallback =
+                    orderedProcesses.Count == 1
+                    && LastAppLaunch != DateTime.MinValue
+                    && (DateTime.UtcNow - LastAppLaunch) <= TimeSpan.FromSeconds(35);
+
+                foreach (Process process in orderedProcesses)
                 {
                     try
                     {
@@ -810,12 +828,23 @@ namespace RBX_Alt_Manager
 
                         string commandLine = string.Empty;
                         try { commandLine = process.GetCommandLine() ?? string.Empty; } catch { }
-                        if (string.IsNullOrWhiteSpace(commandLine))
-                            continue;
+                        bool trackerMatched = false;
 
-                        Match trackerMatch = Regex.Match(commandLine, @"\-b (\d+)");
-                        string trackerId = trackerMatch.Success ? trackerMatch.Groups[1].Value : string.Empty;
-                        if (trackerId != BrowserTrackerID)
+                        if (!string.IsNullOrWhiteSpace(BrowserTrackerID) && !string.IsNullOrWhiteSpace(commandLine))
+                        {
+                            if (commandLine.IndexOf(BrowserTrackerID, StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                trackerMatched = true;
+                            }
+                            else
+                            {
+                                Match trackerMatch = Regex.Match(commandLine, @"(?:\s-b\s+|browsertrackerid[:=\s]+)(\d+)", RegexOptions.IgnoreCase);
+                                string trackerId = trackerMatch.Success ? trackerMatch.Groups[1].Value : string.Empty;
+                                trackerMatched = string.Equals(trackerId, BrowserTrackerID, StringComparison.Ordinal);
+                            }
+                        }
+
+                        if (!trackerMatched && !allowSingleFallback)
                             continue;
 
                         Found = true;
@@ -876,6 +905,10 @@ namespace RBX_Alt_Manager
                         }
                         catch { }
 
+                        DateTime ExtendEnforce = DateTime.Now.AddSeconds(12);
+                        if (ExtendEnforce > EnforceEnds)
+                            EnforceEnds = ExtendEnforce;
+
                         break;
                     }
                     finally
@@ -884,9 +917,11 @@ namespace RBX_Alt_Manager
                     }
                 }
 
-                if (Found) break;
+                if (!Found && DateTime.Now > SearchEnds)
+                    break;
 
-                if (DateTime.Now > Ends) break;
+                if (Found && DateTime.Now > EnforceEnds)
+                    break;
             }
         }
 
