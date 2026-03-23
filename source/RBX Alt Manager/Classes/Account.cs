@@ -47,6 +47,16 @@ namespace RBX_Alt_Manager
         static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
         [DllImport("user32.dll", SetLastError = true)]
         static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        [DllImport("user32.dll", EntryPoint = "GetWindowLong", SetLastError = true)]
+        static extern int GetWindowLong32(IntPtr hWnd, int nIndex);
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongPtr", SetLastError = true)]
+        static extern IntPtr GetWindowLongPtr64(IntPtr hWnd, int nIndex);
+        [DllImport("user32.dll", EntryPoint = "SetWindowLong", SetLastError = true)]
+        static extern int SetWindowLong32(IntPtr hWnd, int nIndex, int dwNewLong);
+        [DllImport("user32.dll", EntryPoint = "SetWindowLongPtr", SetLastError = true)]
+        static extern IntPtr SetWindowLongPtr64(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+        [DllImport("user32.dll", SetLastError = true)]
+        static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
         [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         static extern bool SetWindowText(IntPtr hWnd, string lpString);
         [DllImport("psapi.dll", SetLastError = true)]
@@ -54,9 +64,36 @@ namespace RBX_Alt_Manager
 
         private const int TinyLaunchPosX = 0;
         private const int TinyLaunchPosY = 0;
-        private const int TinyLaunchWidth = 160;
-        private const int TinyLaunchHeight = 90;
+        private const int TinyLaunchWidth = 96;
+        private const int TinyLaunchHeight = 54;
         private const int SW_MINIMIZE = 6;
+        private const int GWL_STYLE = -16;
+        private const int WS_CAPTION = 0x00C00000;
+        private const int WS_THICKFRAME = 0x00040000;
+        private const int WS_MINIMIZEBOX = 0x00020000;
+        private const int WS_MAXIMIZEBOX = 0x00010000;
+        private const int WS_SYSMENU = 0x00080000;
+        private const int WS_POPUP = unchecked((int)0x80000000);
+        private const uint SWP_NOZORDER = 0x0004;
+        private const uint SWP_NOACTIVATE = 0x0010;
+        private const uint SWP_FRAMECHANGED = 0x0020;
+        private const uint SWP_SHOWWINDOW = 0x0040;
+
+        private static int GetWindowStyle(IntPtr handle)
+        {
+            if (IntPtr.Size == 8)
+                return (int)GetWindowLongPtr64(handle, GWL_STYLE).ToInt64();
+
+            return GetWindowLong32(handle, GWL_STYLE);
+        }
+
+        private static void SetWindowStyle(IntPtr handle, int style)
+        {
+            if (IntPtr.Size == 8)
+                _ = SetWindowLongPtr64(handle, GWL_STYLE, new IntPtr(style));
+            else
+                _ = SetWindowLong32(handle, GWL_STYLE, style);
+        }
 
         private static int GetSecureRandomNumber(int minInclusive, int maxExclusive)
         {
@@ -720,8 +757,11 @@ namespace RBX_Alt_Manager
                                 LaunchInfo.FileName = $"roblox-player:1+launchmode:play+gameinfo:{Ticket}+launchtime:{LaunchTime}+placelauncherurl:{HttpUtility.UrlEncode($"https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestGame{(string.IsNullOrEmpty(JobID) ? "" : "Job")}&browserTrackerId={BrowserTrackerID}&placeId={PlaceID}{(string.IsNullOrEmpty(JobID) ? "" : ("&gameId=" + JobID))}&isPlayTogetherGame=false{(AccountManager.IsTeleport ? "&isTeleport=true" : "")}")}+browsertrackerid:{BrowserTrackerID}+robloxLocale:en_us+gameLocale:en_us+channel:+LaunchExp:InApp";
                             using (Process Launcher = Process.Start(LaunchInfo))
                             {
-                                // Do not let launcher hangs block bulk queue progression forever.
-                                if (Launcher != null && !Launcher.WaitForExit(6000))
+                                if (Launcher == null)
+                                    throw new InvalidOperationException("Roblox launcher process failed to start.");
+
+                                // Keep launch queue responsive; don't block on the launcher for long.
+                                if (!Launcher.WaitForExit(750))
                                     Program.Logger.Warn($"[JoinServer] Launcher wait timeout for {Username}; continuing launch queue.");
                             }
 
@@ -761,59 +801,87 @@ namespace RBX_Alt_Manager
             {
                 await Task.Delay(350);
 
-                foreach (var process in Process.GetProcessesByName("RobloxPlayerBeta").Reverse())
+                foreach (Process process in Process.GetProcessesByName("RobloxPlayerBeta").Reverse())
                 {
-                    if (process.MainWindowHandle == IntPtr.Zero) continue;
-
-                    string CommandLine = process.GetCommandLine();
-
-                    var TrackerMatch = Regex.Match(CommandLine, @"\-b (\d+)");
-                    string TrackerID = TrackerMatch.Success ? TrackerMatch.Groups[1].Value : string.Empty;
-
-                    if (TrackerID != BrowserTrackerID) continue;
-
-                    Found = true;
-
                     try
                     {
-                        if (!process.HasExited)
+                        if (process == null || process.HasExited || process.MainWindowHandle == IntPtr.Zero)
+                            continue;
+
+                        string commandLine = string.Empty;
+                        try { commandLine = process.GetCommandLine() ?? string.Empty; } catch { }
+                        if (string.IsNullOrWhiteSpace(commandLine))
+                            continue;
+
+                        Match trackerMatch = Regex.Match(commandLine, @"\-b (\d+)");
+                        string trackerId = trackerMatch.Success ? trackerMatch.Groups[1].Value : string.Empty;
+                        if (trackerId != BrowserTrackerID)
+                            continue;
+
+                        Found = true;
+
+                        try
                         {
-                            try { AccountManager.Instance?.ApplyRobloxProcessOptimization(process); } catch { }
-
-                            try
-                            {
-                                EmptyWorkingSet(process.Handle);
-                            }
-                            catch { }
+                            AccountManager.Instance?.ApplyRobloxProcessOptimization(process);
                         }
+                        catch { }
+
+                        try
+                        {
+                            EmptyWorkingSet(process.Handle);
+                        }
+                        catch { }
+
+                        try
+                        {
+                            int style = GetWindowStyle(process.MainWindowHandle);
+                            int compactStyle = (style & ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU)) | WS_POPUP;
+                            if (compactStyle != style)
+                                SetWindowStyle(process.MainWindowHandle, compactStyle);
+
+                            _ = SetWindowPos(
+                                process.MainWindowHandle,
+                                IntPtr.Zero,
+                                PosX,
+                                PosY,
+                                Width,
+                                Height,
+                                SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+                        }
+                        catch
+                        {
+                            MoveWindow(process.MainWindowHandle, PosX, PosY, Width, Height, true);
+                        }
+
+                        ShowWindow(process.MainWindowHandle, SW_MINIMIZE);
+
+                        try
+                        {
+                            if (!string.IsNullOrWhiteSpace(Username))
+                                SetWindowText(process.MainWindowHandle, Username);
+                        }
+                        catch { }
+
+                        try
+                        {
+                            process.PriorityBoostEnabled = false;
+                            if (process.PriorityClass != ProcessPriorityClass.BelowNormal)
+                                process.PriorityClass = ProcessPriorityClass.BelowNormal;
+                        }
+                        catch { }
+
+                        try
+                        {
+                            EmptyWorkingSet(process.Handle);
+                        }
+                        catch { }
+
+                        break;
                     }
-                    catch { }
-
-                    MoveWindow(process.MainWindowHandle, PosX, PosY, Width, Height, true);
-                    ShowWindow(process.MainWindowHandle, SW_MINIMIZE);
-
-                    try
+                    finally
                     {
-                        if (!string.IsNullOrWhiteSpace(Username))
-                            SetWindowText(process.MainWindowHandle, Username);
+                        try { process.Dispose(); } catch { }
                     }
-                    catch { }
-
-                    try
-                    {
-                        process.PriorityBoostEnabled = false;
-                        if (process.PriorityClass != ProcessPriorityClass.BelowNormal)
-                            process.PriorityClass = ProcessPriorityClass.BelowNormal;
-                    }
-                    catch { }
-
-                    try
-                    {
-                        EmptyWorkingSet(process.Handle);
-                    }
-                    catch { }
-
-                    break;
                 }
 
                 if (Found) break;

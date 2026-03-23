@@ -27,11 +27,30 @@ namespace RBX_Alt_Manager.Classes
             {
                 await Game.WaitForDetails();
 
-                if (Disposing) return;
+                if (Disposing || IsDisposed)
+                    return;
 
-                this.InvokeIfRequired(() => GameName.Text = Game.Details.name);
-                
-                GameImage.LoadAsync(Game.ImageUrl);
+                this.InvokeIfRequired(() =>
+                {
+                    if (Disposing || IsDisposed)
+                        return;
+
+                    if (!string.IsNullOrWhiteSpace(Game?.Details?.name))
+                        GameName.Text = Game.Details.name;
+
+                    string imageUrl = Game?.ImageUrl;
+                    if (string.IsNullOrWhiteSpace(imageUrl))
+                        return;
+
+                    try
+                    {
+                        GameImage.LoadAsync(imageUrl);
+                    }
+                    catch (Exception x)
+                    {
+                        Program.Logger.Warn($"[GameControl] Failed to load game image: {x.Message}");
+                    }
+                });
             });
         }
 

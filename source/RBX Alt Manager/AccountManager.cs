@@ -101,7 +101,9 @@ namespace RBX_Alt_Manager
         private int PresenceUpdateInProgress;
         private int LiveStatusUpdateInProgress;
         private int AutoRejoinUpdateInProgress;
+        private int ManualLaunchGuardInProgress;
         private int ProcessOptimizerInProgress;
+        private DateTime AutoRejoinPausedUntilUtc = DateTime.MinValue;
         private DateTime LastOpenInstancePresenceUpdate = DateTime.MinValue;
         private OLVColumn CurrentPidColumn;
         private OLVColumn CurrentGameColumn;
@@ -801,20 +803,13 @@ namespace RBX_Alt_Manager
 
         private List<Account> GetLaunchTargetsSnapshot()
         {
-            if (SelectedAccounts != null && SelectedAccounts.Count > 1)
-            {
-                List<Account> stickyMulti = ResolveAccountsToList(SelectedAccounts);
-                if (stickyMulti.Count > 1)
-                    return stickyMulti;
-            }
-
             List<Account> selectedNow = GetSelectedAccountsFromView();
             List<Account> resolvedNow = ResolveAccountsToList(selectedNow);
             if (resolvedNow.Count > 0)
+            {
+                SelectedAccounts = resolvedNow;
                 return resolvedNow;
-
-            if (SelectedAccounts != null && SelectedAccounts.Count > 0)
-                return ResolveAccountsToList(SelectedAccounts);
+            }
 
             if (SelectedAccount != null)
                 return ResolveAccountsToList(new List<Account> { SelectedAccount });
@@ -1836,6 +1831,44 @@ namespace RBX_Alt_Manager
             }
         }
 
+        private void PauseAutoRejoinFor(TimeSpan duration, string reason = null)
+        {
+            DateTime untilUtc = DateTime.UtcNow.Add(duration);
+            if (untilUtc > AutoRejoinPausedUntilUtc)
+                AutoRejoinPausedUntilUtc = untilUtc;
+
+            if (!string.IsNullOrWhiteSpace(reason))
+                Program.Logger.Info($"[AutoRejoin] Paused until {AutoRejoinPausedUntilUtc:o} ({reason}).");
+        }
+
+        private void MarkAutoRejoinGrace(Account account, TimeSpan? grace = null)
+        {
+            if (account == null)
+                return;
+
+            string rejoinKey = GetAutoRejoinAccountKey(account);
+            if (string.IsNullOrEmpty(rejoinKey))
+                return;
+
+            DateTime nowUtc = DateTime.UtcNow;
+            TimeSpan graceWindow = grace ?? AutoRejoinOfflineThreshold;
+
+            AutoRejoinState state = AutoRejoinStates.GetOrAdd(rejoinKey, _ => new AutoRejoinState());
+            state.HasSeenActiveSession = true;
+            state.OfflineSinceUtc = nowUtc;
+            state.MissingPidSinceUtc = nowUtc;
+            state.LastAttemptUtc = nowUtc;
+
+            AutoRejoinInProgress.TryRemove(rejoinKey, out _);
+            Program.Logger.Info($"[AutoRejoin] Grace window reset for {account.Username} ({graceWindow.TotalSeconds:0}s).");
+        }
+
+        private void MarkAutoRejoinGrace(IEnumerable<Account> accounts, TimeSpan? grace = null)
+        {
+            foreach (Account account in accounts ?? Enumerable.Empty<Account>())
+                MarkAutoRejoinGrace(account, grace);
+        }
+
         private void UpdateAutoRejoin()
         {
             if (!General.Get<bool>("AutoRejoin"))
@@ -1846,6 +1879,11 @@ namespace RBX_Alt_Manager
             }
 
             DateTime NowUtc = DateTime.UtcNow;
+            if (Interlocked.CompareExchange(ref ManualLaunchGuardInProgress, 0, 0) == 1)
+                return;
+
+            if (NowUtc < AutoRejoinPausedUntilUtc)
+                return;
 
             HashSet<string> ExistingAccounts = new HashSet<string>(StringComparer.Ordinal);
 
@@ -1912,6 +1950,8 @@ namespace RBX_Alt_Manager
                     continue;
 
                 State.LastAttemptUtc = NowUtc;
+                State.OfflineSinceUtc = NowUtc;
+                State.MissingPidSinceUtc = NowUtc;
 
                 string reason = MissingPidDue ? "missing_pid" : "stale_or_missing_signal";
                 Program.Logger.Info($"[AutoRejoin] Watchdog trigger for {account.Username}: reason={reason}, key={RejoinKey}, pid={account.CurrentProcessId}, lastSignal={(LastSignalUtc.HasValue ? LastSignalUtc.Value.ToString("o") : "none")}, open={account.HasOpenInstance}, inGame={InGame}, stale={SignalStale}, missingSignal={MissingSignal}, managed={ManagedAccount}");
@@ -2974,6 +3014,37 @@ namespace RBX_Alt_Manager
             return Result;
         }
 
+        private static int ForceKillAllRobloxProcessesImmediate()
+        {
+            int killed = 0;
+
+            foreach (Process process in GetAllRobloxClientProcessesForRecovery())
+            {
+                try
+                {
+                    if (process.HasExited)
+                        continue;
+
+                    process.Kill();
+                    killed++;
+                }
+                catch { }
+                finally
+                {
+                    try { process.Dispose(); } catch { }
+                }
+            }
+
+            try
+            {
+                RobloxWatcher.Instances.Clear();
+                RobloxWatcher.Seen.Clear();
+            }
+            catch { }
+
+            return killed;
+        }
+
         private async Task CloseAllRobloxInstancesForRetry()
         {
             try
@@ -3276,14 +3347,7 @@ namespace RBX_Alt_Manager
         private void AccountsView_SelectedIndexChanged(object sender, EventArgs e)
         {
             List<Account> selectedNow = GetSelectedAccountsFromView();
-            bool DowngradeFromMultiOnFocusLoss =
-                !AccountsView.Focused
-                && SelectedAccounts != null
-                && SelectedAccounts.Count > 1
-                && selectedNow.Count <= 1;
-
-            if (!DowngradeFromMultiOnFocusLoss)
-                SelectedAccounts = selectedNow;
+            SelectedAccounts = selectedNow;
 
             UpdateSelectionStatusText();
 
@@ -3360,6 +3424,9 @@ namespace RBX_Alt_Manager
             bool LaunchMultiple = LaunchTargets.Count > 1;
             Account SingleTarget = LaunchTargets.Count == 1 ? LaunchTargets[0] : null;
             string JoinJobId = VIPServer ? JobID.Text.Substring(4) : JobID.Text;
+            PauseAutoRejoinFor(TimeSpan.FromSeconds(45), "manual join launch");
+            MarkAutoRejoinGrace(LaunchTargets, AutoRejoinOfflineThreshold);
+            Interlocked.Exchange(ref ManualLaunchGuardInProgress, 1);
 
             _ = Task.Run(async () => // Run launch worker on thread-pool with hard exception guard to avoid process-killing async-void crashes.
             {
@@ -3384,6 +3451,11 @@ namespace RBX_Alt_Manager
                 catch (Exception x)
                 {
                     Program.Logger.Error($"[JoinServer] Unhandled launch worker error: {x}");
+                }
+                finally
+                {
+                    PauseAutoRejoinFor(TimeSpan.FromSeconds(20), "manual join launch settling");
+                    Interlocked.Exchange(ref ManualLaunchGuardInProgress, 0);
                 }
             });
         }
@@ -3412,25 +3484,36 @@ namespace RBX_Alt_Manager
 
                 bool LaunchMultiple = LaunchTargets.Count > 1;
                 Account SingleTarget = LaunchTargets.Count == 1 ? LaunchTargets[0] : null;
+                PauseAutoRejoinFor(TimeSpan.FromSeconds(45), "manual follow launch");
+                MarkAutoRejoinGrace(LaunchTargets, AutoRejoinOfflineThreshold);
+                Interlocked.Exchange(ref ManualLaunchGuardInProgress, 1);
 
-                if (LaunchMultiple)
+                try
                 {
-                    LauncherToken = new CancellationTokenSource();
-
-                    await Task.Run(async () =>
+                    if (LaunchMultiple)
                     {
-                        if (!EnsureMultiRobloxForBulkLaunch())
-                            Program.Logger.Warn("[FollowLaunch] Multi Roblox prep failed in pre-check; continuing with best-effort launch.");
+                        LauncherToken = new CancellationTokenSource();
 
-                        await LaunchAccounts(LaunchTargets, UserId, "", true);
-                    });
+                        await Task.Run(async () =>
+                        {
+                            if (!EnsureMultiRobloxForBulkLaunch())
+                                Program.Logger.Warn("[FollowLaunch] Multi Roblox prep failed in pre-check; continuing with best-effort launch.");
+
+                            await LaunchAccounts(LaunchTargets, UserId, "", true);
+                        });
+                    }
+                    else if (SingleTarget != null)
+                    {
+                        string res = await JoinWithFailureRecovery(SingleTarget, UserId, "", true, false, "FollowJoin");
+
+                        if (!IsJoinSuccess(res))
+                            MessageBox.Show(res);
+                    }
                 }
-                else if (SingleTarget != null)
+                finally
                 {
-                    string res = await JoinWithFailureRecovery(SingleTarget, UserId, "", true, false, "FollowJoin");
-
-                    if (!IsJoinSuccess(res))
-                        MessageBox.Show(res);
+                    PauseAutoRejoinFor(TimeSpan.FromSeconds(20), "manual follow launch settling");
+                    Interlocked.Exchange(ref ManualLaunchGuardInProgress, 0);
                 }
             }
             catch (Exception x)
@@ -3465,12 +3548,14 @@ namespace RBX_Alt_Manager
                 return;
 
             KillAllInstances.Enabled = false;
+            PauseAutoRejoinFor(TimeSpan.FromSeconds(20), "manual kill all");
+            Interlocked.Exchange(ref ManualLaunchGuardInProgress, 1);
 
             try
             {
                 CancelLaunching();
 
-                await Task.Run(() => ForceStopAllRobloxProcessesForMultiPrep());
+                int killedCount = await Task.Run(() => ForceKillAllRobloxProcessesImmediate());
 
                 List<Account> AccountsSnapshot = AccountsList?.Where(account => account != null).ToList() ?? new List<Account>();
                 foreach (Account account in AccountsSnapshot)
@@ -3482,9 +3567,9 @@ namespace RBX_Alt_Manager
 
                 AccountsView.InvokeIfRequired(() => AccountsView.RefreshObjects(AccountsSnapshot));
 
-                await TryUpdateLiveStatus(true);
+                _ = Task.Run(async () => await TryUpdateLiveStatus(true));
 
-                Program.Logger.Info("[KillAll] User-triggered kill of all Roblox instances completed.");
+                Program.Logger.Info($"[KillAll] User-triggered hard kill completed. killed={killedCount}");
             }
             catch (Exception x)
             {
@@ -3493,6 +3578,7 @@ namespace RBX_Alt_Manager
             }
             finally
             {
+                Interlocked.Exchange(ref ManualLaunchGuardInProgress, 0);
                 KillAllInstances.Enabled = true;
             }
         }
@@ -3959,7 +4045,8 @@ namespace RBX_Alt_Manager
 
         private async Task LaunchAccounts(List<Account> Accounts, long PlaceID, string JobID, bool FollowUser = false, bool VIPServer = false)
         {
-            int Delay = General.Exists("AccountJoinDelay") ? General.Get<int>("AccountJoinDelay") : 8;
+            int DelaySeconds = General.Exists("AccountJoinDelay") ? General.Get<int>("AccountJoinDelay") : 8;
+            int InterLaunchDelayMs = Math.Max(0, DelaySeconds * 1000);
 
             bool AsyncJoin = General.Get<bool>("AsyncJoin");
             CancellationTokenSource Token = LauncherToken;
@@ -3968,7 +4055,10 @@ namespace RBX_Alt_Manager
             bool MultiLaunch = LaunchQueue.Count > 1;
 
             if (MultiLaunch)
+            {
                 AsyncJoin = false; // Always run selected multi-launch as strict queue.
+                InterLaunchDelayMs = 1000; // Near-instant queue for multiselect launch.
+            }
 
             Program.Logger.Info($"[BulkLaunch] Queue size {LaunchQueue.Count}: {string.Join(", ", LaunchQueue.Select(account => account?.Username ?? "unknown"))}");
 
@@ -3978,59 +4068,122 @@ namespace RBX_Alt_Manager
             try
             {
                 int total = LaunchQueue.Count;
-                int index = 0;
-
-                foreach (Account account in LaunchQueue)
+                if (MultiLaunch)
                 {
-                    index++;
+                    object failureLock = new object();
+                    List<Task> launchTasks = new List<Task>();
 
-                    if (Token != null && Token.IsCancellationRequested)
-                        break;
-
-                    Program.Logger.Info($"[BulkLaunch] Launching {index}/{total}: {account?.Username ?? "unknown"}");
-
-                    try
+                    for (int i = 0; i < total; i++)
                     {
+                        Account account = LaunchQueue[i];
+                        int launchIndex = i + 1;
+
+                        if (Token != null && Token.IsCancellationRequested)
+                            break;
+
+                        Program.Logger.Info($"[BulkLaunch] Launching {launchIndex}/{total}: {account?.Username ?? "unknown"}");
+
                         if (General.Get<bool>("EnableMultiRbx") && !PrepareMultiRobloxForAccountLaunch(4))
                             Program.Logger.Warn($"[BulkLaunch] Multi Roblox prep failed right before launching {account.Username}.");
 
-                        // Intentionally mirror manual single-account launch behavior for each selected account.
-                        string Result = await JoinWithFailureRecovery(
-                            account,
-                            PlaceID,
-                            JobID,
-                            FollowUser,
-                            VIPServer,
-                            "BulkLaunch",
-                            allowGlobalReset: false,
-                            requireNewProcess: true);
-
-                        if (!IsJoinSuccess(Result))
+                        launchTasks.Add(Task.Run(async () =>
                         {
-                            Program.Logger.Warn($"[BulkLaunch] Failed launching {account.Username}: {Result}");
-                            Failures.Add($"{account.Username}: {Result.Split('\n').FirstOrDefault() ?? Result}");
-                        }
-                        else
+                            try
+                            {
+                                string Result = await JoinWithFailureRecovery(
+                                    account,
+                                    PlaceID,
+                                    JobID,
+                                    FollowUser,
+                                    VIPServer,
+                                    "BulkLaunch",
+                                    allowGlobalReset: false,
+                                    requireNewProcess: false);
+
+                                if (!IsJoinSuccess(Result))
+                                {
+                                    Program.Logger.Warn($"[BulkLaunch] Failed launching {account.Username}: {Result}");
+                                    lock (failureLock)
+                                        Failures.Add($"{account.Username}: {Result.Split('\n').FirstOrDefault() ?? Result}");
+                                }
+                                else
+                                {
+                                    MarkAutoRejoinGrace(account, AutoRejoinOfflineThreshold);
+                                    int trackerPid = FindRobloxProcessIdByTracker(account.BrowserTrackerID);
+                                    Program.Logger.Info($"[BulkLaunch] Success launching {launchIndex}/{total}: {account.Username} | pid={trackerPid} | totalRoblox={GetRobloxPlayerProcessCount()}");
+                                }
+                            }
+                            catch (Exception x)
+                            {
+                                Program.Logger.Error($"[BulkLaunch] Exception launching {account?.Username ?? "unknown"}: {x}");
+                                lock (failureLock)
+                                    Failures.Add($"{account?.Username ?? "unknown"}: {x.Message}");
+                            }
+                        }));
+
+                        if (InterLaunchDelayMs > 0)
+                            await Task.Delay(InterLaunchDelayMs);
+                    }
+
+                    await Task.WhenAll(launchTasks);
+                }
+                else
+                {
+                    int index = 0;
+
+                    foreach (Account account in LaunchQueue)
+                    {
+                        index++;
+
+                        if (Token != null && Token.IsCancellationRequested)
+                            break;
+
+                        Program.Logger.Info($"[BulkLaunch] Launching {index}/{total}: {account?.Username ?? "unknown"}");
+
+                        try
                         {
-                            int trackerPid = FindRobloxProcessIdByTracker(account.BrowserTrackerID);
-                            Program.Logger.Info($"[BulkLaunch] Success launching {index}/{total}: {account.Username} | pid={trackerPid} | totalRoblox={GetRobloxPlayerProcessCount()}");
+                            if (General.Get<bool>("EnableMultiRbx") && !PrepareMultiRobloxForAccountLaunch(4))
+                                Program.Logger.Warn($"[BulkLaunch] Multi Roblox prep failed right before launching {account.Username}.");
+
+                            // Keep strict validation for single-launch path.
+                            string Result = await JoinWithFailureRecovery(
+                                account,
+                                PlaceID,
+                                JobID,
+                                FollowUser,
+                                VIPServer,
+                                "BulkLaunch",
+                                allowGlobalReset: false,
+                                requireNewProcess: true);
+
+                            if (!IsJoinSuccess(Result))
+                            {
+                                Program.Logger.Warn($"[BulkLaunch] Failed launching {account.Username}: {Result}");
+                                Failures.Add($"{account.Username}: {Result.Split('\n').FirstOrDefault() ?? Result}");
+                            }
+                            else
+                            {
+                                MarkAutoRejoinGrace(account, AutoRejoinOfflineThreshold);
+                                int trackerPid = FindRobloxProcessIdByTracker(account.BrowserTrackerID);
+                                Program.Logger.Info($"[BulkLaunch] Success launching {index}/{total}: {account.Username} | pid={trackerPid} | totalRoblox={GetRobloxPlayerProcessCount()}");
+                            }
                         }
-                    }
-                    catch (Exception x)
-                    {
-                        Program.Logger.Error($"[BulkLaunch] Exception launching {account?.Username ?? "unknown"}: {x}");
-                        Failures.Add($"{account?.Username ?? "unknown"}: {x.Message}");
-                    }
+                        catch (Exception x)
+                        {
+                            Program.Logger.Error($"[BulkLaunch] Exception launching {account?.Username ?? "unknown"}: {x}");
+                            Failures.Add($"{account?.Username ?? "unknown"}: {x.Message}");
+                        }
 
-                    if (AsyncJoin)
-                    {
-                        while (!LaunchNext)
-                            await Task.Delay(50);
-                    }
-                    else
-                        await Task.Delay(Delay * 1000);
+                        if (AsyncJoin)
+                        {
+                            while (!LaunchNext)
+                                await Task.Delay(50);
+                        }
+                        else if (InterLaunchDelayMs > 0)
+                            await Task.Delay(InterLaunchDelayMs);
 
-                    LaunchNext = false;
+                        LaunchNext = false;
+                    }
                 }
             }
             finally
