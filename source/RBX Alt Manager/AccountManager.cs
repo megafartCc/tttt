@@ -100,8 +100,8 @@ namespace RBX_Alt_Manager
         private readonly static Regex MultiRbxHandleRegex = new Regex(@"^\s*([0-9A-F]+):\s+\w+\s+.+\\(ROBLOX_singletonMutex|ROBLOX_singletonEvent)\b", RegexOptions.IgnoreCase | RegexOptions.Multiline | RegexOptions.Compiled);
         private int PresenceUpdateInProgress;
         private int LiveStatusUpdateInProgress;
+        private int AutoRejoinUpdateInProgress;
         private int ProcessOptimizerInProgress;
-        private int BulkLaunchInProgress;
         private DateTime LastOpenInstancePresenceUpdate = DateTime.MinValue;
         private OLVColumn CurrentPidColumn;
         private OLVColumn CurrentGameColumn;
@@ -113,6 +113,7 @@ namespace RBX_Alt_Manager
         private const long AutoRejoinPlaceId = 109983668079237;
         private static readonly TimeSpan AutoRejoinOfflineThreshold = TimeSpan.FromSeconds(105);
         private static readonly TimeSpan AutoRejoinRetryCooldown = TimeSpan.FromSeconds(30);
+        private static readonly TimeSpan AutoRejoinRelaunchTimeout = TimeSpan.FromSeconds(75);
         private readonly ConcurrentDictionary<string, AutoRejoinState> AutoRejoinStates = new ConcurrentDictionary<string, AutoRejoinState>();
         private readonly ConcurrentDictionary<string, byte> AutoRejoinInProgress = new ConcurrentDictionary<string, byte>();
         private readonly ConcurrentDictionary<string, ServerClaimState> ScriptServerClaims = new ConcurrentDictionary<string, ServerClaimState>();
@@ -183,6 +184,8 @@ namespace RBX_Alt_Manager
         private static extern bool EmptyWorkingSet(IntPtr hProcess);
         [DllImport("ntdll.dll")]
         private static extern int NtSetInformationProcess(IntPtr processHandle, int processInformationClass, ref int processInformation, int processInformationLength);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool SetWindowText(IntPtr hWnd, string lpString);
 
         private const int ProcessIoPriorityClass = 33;
 
@@ -396,12 +399,61 @@ namespace RBX_Alt_Manager
             return $"{(int)Age.TotalDays}d ago";
         }
 
+        private static string FormatCountdown(TimeSpan Remaining)
+        {
+            if (Remaining < TimeSpan.Zero)
+                Remaining = TimeSpan.Zero;
+
+            if (Remaining.TotalMinutes < 1)
+                return $"{Math.Max(0, (int)Math.Ceiling(Remaining.TotalSeconds))}s";
+
+            if (Remaining.TotalHours < 1)
+                return $"{Math.Max(0, (int)Remaining.TotalMinutes)}m {Math.Max(0, Remaining.Seconds)}s";
+
+            return $"{Math.Max(0, (int)Remaining.TotalHours)}h {Math.Max(0, Remaining.Minutes)}m";
+        }
+
+        private string GetAutoRejoinCountdownText(Account account, DateTime nowUtc)
+        {
+            if (account == null || General == null || !General.Get<bool>("AutoRejoin"))
+                return string.Empty;
+
+            string RejoinKey = GetAutoRejoinAccountKey(account);
+            if (string.IsNullOrEmpty(RejoinKey))
+                return string.Empty;
+
+            DateTime? LastSignalUtc = account.LastLiveStatusUpdateUtc != DateTime.MinValue ? account.LastLiveStatusUpdateUtc : (DateTime?)null;
+
+            DateTime OfflineSinceUtc = nowUtc;
+            if (AutoRejoinStates.TryGetValue(RejoinKey, out AutoRejoinState state) && state?.OfflineSinceUtc.HasValue == true)
+                OfflineSinceUtc = state.OfflineSinceUtc.Value;
+            else if (LastSignalUtc.HasValue && LastSignalUtc.Value <= nowUtc)
+                OfflineSinceUtc = LastSignalUtc.Value;
+
+            TimeSpan OfflineDuration = nowUtc - OfflineSinceUtc;
+            if (OfflineDuration < TimeSpan.Zero)
+                OfflineDuration = TimeSpan.Zero;
+
+            if (AutoRejoinInProgress.ContainsKey(RejoinKey))
+                return "restarting...";
+
+            TimeSpan Remaining = AutoRejoinOfflineThreshold - OfflineDuration;
+            if (Remaining <= TimeSpan.Zero)
+                return "restart due";
+
+            return $"restart in {FormatCountdown(Remaining)}";
+        }
+
         private string GetLastSeenText(Account account)
         {
             if (account == null) return string.Empty;
+            DateTime NowUtc = DateTime.UtcNow;
+            string RestartText = GetAutoRejoinCountdownText(account, NowUtc);
+
             if (account.LastLiveStatusUpdateUtc == DateTime.MinValue)
             {
                 string RejoinKey = GetAutoRejoinAccountKey(account);
+                string BaseText = "No signal";
 
                 if (General != null
                     && General.Get<bool>("AutoRejoin")
@@ -409,13 +461,14 @@ namespace RBX_Alt_Manager
                     && AutoRejoinStates.TryGetValue(RejoinKey, out AutoRejoinState state)
                     && state?.OfflineSinceUtc.HasValue == true)
                 {
-                    return $"No signal ({FormatLastSeenAge(state.OfflineSinceUtc.Value)})";
+                    BaseText = $"No signal ({FormatLastSeenAge(state.OfflineSinceUtc.Value)})";
                 }
 
-                return "No signal";
+                return string.IsNullOrEmpty(RestartText) ? BaseText : $"{BaseText} ({RestartText})";
             }
 
-            return FormatLastSeenAge(account.LastLiveStatusUpdateUtc);
+            string SeenText = FormatLastSeenAge(account.LastLiveStatusUpdateUtc);
+            return string.IsNullOrEmpty(RestartText) ? SeenText : $"{SeenText} ({RestartText})";
         }
 
         private void SetupAccountLastSeenColumn()
@@ -427,7 +480,7 @@ namespace RBX_Alt_Manager
             {
                 IsEditable = false,
                 Sortable = false,
-                Width = (int)(90 * Program.Scale)
+                Width = (int)(200 * Program.Scale)
             };
 
             LastSeenColumn.AspectGetter = rowObject => rowObject is Account account ? GetLastSeenText(account) : string.Empty;
@@ -1166,13 +1219,18 @@ namespace RBX_Alt_Manager
             LiveStatusTimer.Elapsed += async (s, e) => await TryUpdateLiveStatus();
 
             LastSeenTimer = new System.Timers.Timer(1000) { AutoReset = true, Enabled = true };
-            LastSeenTimer.Elapsed += (s, e) => RefreshLastSeenColumn();
+            LastSeenTimer.Elapsed += (s, e) =>
+            {
+                TryRunAutoRejoinWatchdog();
+                RefreshLastSeenColumn();
+            };
 
             ProcessOptimizerTimer = new System.Timers.Timer(2000) { AutoReset = true, Enabled = true };
             ProcessOptimizerTimer.Elapsed += (s, e) => TryApplyProcessOptimization();
 
             _ = TryUpdateLiveStatus(true);
             _ = TryUpdatePresence();
+            TryRunAutoRejoinWatchdog();
             TryApplyProcessOptimization();
         }
 
@@ -1569,6 +1627,40 @@ namespace RBX_Alt_Manager
             }
         }
 
+        private void TryRunAutoRejoinWatchdog()
+        {
+            if (Interlocked.Exchange(ref AutoRejoinUpdateInProgress, 1) == 1)
+                return;
+
+            try
+            {
+                UpdateAutoRejoin();
+            }
+            catch (Exception x)
+            {
+                Program.Logger.Error($"[AutoRejoin] Watchdog loop error: {x}");
+            }
+            finally
+            {
+                Interlocked.Exchange(ref AutoRejoinUpdateInProgress, 0);
+            }
+        }
+
+        private async Task RelaunchForAutoRejoinWithTimeout(Account account, string rejoinKey)
+        {
+            Task relaunchTask = RelaunchForAutoRejoin(account);
+            Task timeoutTask = Task.Delay(AutoRejoinRelaunchTimeout);
+
+            Task completed = await Task.WhenAny(relaunchTask, timeoutTask);
+            if (completed == relaunchTask)
+                return;
+
+            Program.Logger.Warn($"[AutoRejoin] Relaunch timeout for {account?.Username ?? "unknown"} after {AutoRejoinRelaunchTimeout.TotalSeconds:0}s. Clearing watchdog lock.");
+
+            if (!string.IsNullOrEmpty(rejoinKey))
+                AutoRejoinInProgress.TryRemove(rejoinKey, out _);
+        }
+
         private async Task RelaunchForAutoRejoin(Account account)
         {
             string RejoinKey = GetAutoRejoinAccountKey(account);
@@ -1607,9 +1699,6 @@ namespace RBX_Alt_Manager
                 AutoRejoinInProgress.Clear();
                 return;
             }
-
-            if (Interlocked.CompareExchange(ref BulkLaunchInProgress, 0, 0) == 1)
-                return;
 
             DateTime NowUtc = DateTime.UtcNow;
 
@@ -1667,7 +1756,7 @@ namespace RBX_Alt_Manager
                 State.LastAttemptUtc = NowUtc;
 
                 Program.Logger.Info($"[AutoRejoin] Watchdog trigger for {account.Username}: key={RejoinKey}, pid={account.CurrentProcessId}, lastSignal={(LastSignalUtc.HasValue ? LastSignalUtc.Value.ToString("o") : "none")}, open={account.HasOpenInstance}, inGame={InGame}, stale={SignalStale}, missingSignal={MissingSignal}, managed={ManagedAccount}");
-                _ = RelaunchForAutoRejoin(account);
+                _ = RelaunchForAutoRejoinWithTimeout(account, RejoinKey);
             }
 
             foreach (string Key in AutoRejoinStates.Keys)
@@ -3700,7 +3789,6 @@ namespace RBX_Alt_Manager
             if (MultiLaunch)
                 AsyncJoin = false; // Always run selected multi-launch as strict queue.
 
-            Interlocked.Exchange(ref BulkLaunchInProgress, 1);
             NormalizeBrowserTrackerIds();
 
             try
@@ -3767,7 +3855,6 @@ namespace RBX_Alt_Manager
                     try { Token.Dispose(); } catch { }
                 }
 
-                Interlocked.Exchange(ref BulkLaunchInProgress, 0);
             }
 
             if (Failures.Count > 0)
@@ -4009,6 +4096,25 @@ namespace RBX_Alt_Manager
             try
             {
                 EmptyWorkingSet(process.Handle);
+            }
+            catch { }
+
+            try
+            {
+                if (process.MainWindowHandle != IntPtr.Zero)
+                {
+                    string title = null;
+                    List<Account> snapshot = AccountsList?.ToList();
+                    if (snapshot != null)
+                    {
+                        Account matched = snapshot.FirstOrDefault(account => account != null && account.CurrentProcessId == process.Id && !string.IsNullOrWhiteSpace(account.Username));
+                        if (matched != null)
+                            title = matched.Username;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(title))
+                        SetWindowText(process.MainWindowHandle, title);
+                }
             }
             catch { }
         }
@@ -4350,7 +4456,7 @@ namespace RBX_Alt_Manager
             List<Account> PresenceRefreshTargets = new List<Account>(PresenceFallback);
             PresenceRefreshTargets.AddRange(UpdateAccountGameNames(GameNameTargets));
             PresenceRefreshTargets = PresenceRefreshTargets.Distinct().ToList();
-            UpdateAutoRejoin();
+            TryRunAutoRejoinWatchdog();
 
             if (PresenceRefreshTargets.Count == 0) return;
             if (!ForcePresenceRefresh && (DateTime.Now - LastOpenInstancePresenceUpdate).TotalSeconds < 6) return;

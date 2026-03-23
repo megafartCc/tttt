@@ -47,6 +47,8 @@ namespace RBX_Alt_Manager
         static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
         [DllImport("user32.dll", SetLastError = true)]
         static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern bool SetWindowText(IntPtr hWnd, string lpString);
         [DllImport("psapi.dll", SetLastError = true)]
         static extern bool EmptyWorkingSet(IntPtr hProcess);
 
@@ -785,6 +787,13 @@ namespace RBX_Alt_Manager
 
                     MoveWindow(process.MainWindowHandle, PosX, PosY, Width, Height, true);
                     ShowWindow(process.MainWindowHandle, SW_MINIMIZE);
+
+                    try
+                    {
+                        if (!string.IsNullOrWhiteSpace(Username))
+                            SetWindowText(process.MainWindowHandle, Username);
+                    }
+                    catch { }
 
                     try
                     {
