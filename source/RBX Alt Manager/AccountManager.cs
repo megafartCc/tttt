@@ -184,8 +184,6 @@ namespace RBX_Alt_Manager
 
         [DllImport("DwmApi")]
         private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, int[] attrValue, int attrSize);
-        [DllImport("psapi.dll", SetLastError = true)]
-        private static extern bool EmptyWorkingSet(IntPtr hProcess);
         [DllImport("ntdll.dll")]
         private static extern int NtSetInformationProcess(IntPtr processHandle, int processInformationClass, ref int processInformation, int processInformationLength);
         [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -3442,7 +3440,7 @@ namespace RBX_Alt_Manager
                     }
                     else if (SingleTarget != null)
                     {
-                        string res = await JoinWithFailureRecovery(SingleTarget, PlaceId, JoinJobId, false, VIPServer, "JoinServer");
+                        string res = await JoinWithFailureRecovery(SingleTarget, PlaceId, JoinJobId, false, VIPServer, "JoinServer", allowGlobalReset: false);
 
                         if (!IsJoinSuccess(res))
                             this.InvokeIfRequired(() => MessageBox.Show(res));
@@ -3504,7 +3502,7 @@ namespace RBX_Alt_Manager
                     }
                     else if (SingleTarget != null)
                     {
-                        string res = await JoinWithFailureRecovery(SingleTarget, UserId, "", true, false, "FollowJoin");
+                        string res = await JoinWithFailureRecovery(SingleTarget, UserId, "", true, false, "FollowJoin", allowGlobalReset: false);
 
                         if (!IsJoinSuccess(res))
                             MessageBox.Show(res);
@@ -4057,7 +4055,7 @@ namespace RBX_Alt_Manager
             if (MultiLaunch)
             {
                 AsyncJoin = false; // Always run selected multi-launch as strict queue.
-                InterLaunchDelayMs = 1000; // Near-instant queue for multiselect launch.
+                InterLaunchDelayMs = 300; // Ultra-fast queue for multiselect launch.
             }
 
             Program.Logger.Info($"[BulkLaunch] Queue size {LaunchQueue.Count}: {string.Join(", ", LaunchQueue.Select(account => account?.Username ?? "unknown"))}");
@@ -4070,6 +4068,9 @@ namespace RBX_Alt_Manager
                 int total = LaunchQueue.Count;
                 if (MultiLaunch)
                 {
+                    if (General.Get<bool>("EnableMultiRbx") && !EnsureMultiRobloxForBulkLaunch())
+                        Program.Logger.Warn("[BulkLaunch] Initial multi-Roblox prep failed; continuing with best-effort fast launch.");
+
                     object failureLock = new object();
                     List<Task> launchTasks = new List<Task>();
 
@@ -4082,9 +4083,6 @@ namespace RBX_Alt_Manager
                             break;
 
                         Program.Logger.Info($"[BulkLaunch] Launching {launchIndex}/{total}: {account?.Username ?? "unknown"}");
-
-                        if (General.Get<bool>("EnableMultiRbx") && !PrepareMultiRobloxForAccountLaunch(4))
-                            Program.Logger.Warn($"[BulkLaunch] Multi Roblox prep failed right before launching {account.Username}.");
 
                         launchTasks.Add(Task.Run(async () =>
                         {
@@ -4433,12 +4431,6 @@ namespace RBX_Alt_Manager
                 }
                 catch { }
             }
-
-            try
-            {
-                EmptyWorkingSet(process.Handle);
-            }
-            catch { }
 
             try
             {
