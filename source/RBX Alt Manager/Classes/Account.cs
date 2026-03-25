@@ -43,6 +43,7 @@ namespace RBX_Alt_Manager
         [JsonIgnore] public string CurrentGameName = string.Empty;
         [JsonIgnore] public DateTime LastLiveStatusUpdateUtc = DateTime.MinValue;
         [JsonIgnore] public int CurrentProcessId;
+        [JsonIgnore] private int LastTinyLaunchSlot = -1;
 
         [DllImport("user32.dll", SetLastError = true)]
         static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
@@ -132,6 +133,24 @@ namespace RBX_Alt_Manager
             }
         }
 
+        private static bool TryGetProcessStartTimeUtc(Process process, out DateTime startTimeUtc)
+        {
+            startTimeUtc = DateTime.MinValue;
+
+            if (process == null)
+                return false;
+
+            try
+            {
+                startTimeUtc = process.StartTime.ToUniversalTime();
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         private static (Rectangle WorkingArea, int CellWidth, int CellHeight, int Columns, int Rows, int TotalSlots) GetTinyLaunchGridLayout()
         {
             Rectangle workingArea = Screen.PrimaryScreen?.WorkingArea
@@ -175,7 +194,7 @@ namespace RBX_Alt_Manager
             return slot >= 0 && slot < layout.TotalSlots;
         }
 
-        private static int AcquireTinyLaunchSlot()
+        private static int AcquireTinyLaunchSlot(int ignoredProcessId = 0, int preferredSlot = -1)
         {
             lock (TinyLaunchSlotLock)
             {
@@ -190,6 +209,11 @@ namespace RBX_Alt_Manager
                 {
                     try
                     {
+                        int processId = -1;
+                        try { processId = process.Id; } catch { }
+                        if (ignoredProcessId > 0 && processId == ignoredProcessId)
+                            continue;
+
                         if (!TryGetProcessMainWindowHandle(process, out IntPtr mainWindowHandle))
                             continue;
 
@@ -201,6 +225,12 @@ namespace RBX_Alt_Manager
                     {
                         try { process.Dispose(); } catch { }
                     }
+                }
+
+                if (preferredSlot >= 0 && preferredSlot < layout.TotalSlots && !occupiedSlots.Contains(preferredSlot))
+                {
+                    PendingTinyLaunchSlots.Add(preferredSlot);
+                    return preferredSlot;
                 }
 
                 for (int slot = 0; slot < layout.TotalSlots; slot++)
@@ -236,6 +266,33 @@ namespace RBX_Alt_Manager
             int posY = layout.WorkingArea.Top + TinyLaunchPosY + (row * layout.CellHeight);
 
             return (posX, posY);
+        }
+
+        private int FindTrackedRobloxProcessId()
+        {
+            if (string.IsNullOrWhiteSpace(BrowserTrackerID))
+                return 0;
+
+            try
+            {
+                foreach (Process process in Process.GetProcessesByName("RobloxPlayerBeta"))
+                {
+                    try
+                    {
+                        string commandLine = process.GetCommandLine() ?? string.Empty;
+                        if (commandLine.IndexOf(BrowserTrackerID, StringComparison.OrdinalIgnoreCase) >= 0)
+                            return process.Id;
+                    }
+                    catch { }
+                    finally
+                    {
+                        try { process.Dispose(); } catch { }
+                    }
+                }
+            }
+            catch { }
+
+            return 0;
         }
 
         private static int GetSecureRandomNumber(int minInclusive, int maxExclusive)
@@ -747,6 +804,8 @@ namespace RBX_Alt_Manager
                 BrowserTrackerID = trackerId; // Persisted through normal SaveAccounts flow later.
             }
 
+            int ignoredProcessId = CurrentProcessId > 0 ? CurrentProcessId : FindTrackedRobloxProcessId();
+
             try { ClientSettingsPatcher.PatchSettings(); } catch (Exception Ex) { Program.Logger.Error($"Failed to patch ClientAppSettings: {Ex}"); }
 
             if (!GetCSRFToken(out string Token)) return $"ERROR: Account Session Expired, re-add the account or try again. (Invalid X-CSRF-Token)\n{Token}";
@@ -876,7 +935,7 @@ namespace RBX_Alt_Manager
                             Roblox.Arguments = string.Format("--app -t {0} -j \"https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestGame{3}&placeId={1}{2}&isPlayTogetherGame=false\"", Ticket, PlaceID, "&gameId=" + JobID, string.IsNullOrEmpty(JobID) ? "" : "Job");
                     });
 
-                    _ = Task.Run(AdjustWindowPosition);
+                    _ = Task.Run(() => AdjustWindowPosition(ignoredProcessId, LastTinyLaunchSlot));
 
                     return "Success";
                 }
@@ -911,7 +970,7 @@ namespace RBX_Alt_Manager
                             if (!Internal)
                                 AccountManager.Instance.NextAccount();
 
-                            _ = Task.Run(AdjustWindowPosition);
+                            _ = Task.Run(() => AdjustWindowPosition(ignoredProcessId, LastTinyLaunchSlot));
                         }
                         catch (Exception x)
                         {
@@ -930,14 +989,14 @@ namespace RBX_Alt_Manager
                 return "ERROR: Invalid Authentication Ticket, re-add the account or try again\n(Failed to get Authentication Ticket, Roblox has probably signed you out)";
         }
 
-        public async void AdjustWindowPosition()
+        public async void AdjustWindowPosition(int ignoredProcessId = 0, int preferredSlot = -1)
         {
             int slot = -1;
             bool slotReleased = false;
 
             try
             {
-                slot = AcquireTinyLaunchSlot();
+                slot = AcquireTinyLaunchSlot(ignoredProcessId, preferredSlot);
                 (int PosX, int PosY) = GetTinyLaunchGridPosition(slot);
                 int Width = TinyLaunchWidth;
                 int Height = TinyLaunchHeight;
@@ -971,12 +1030,21 @@ namespace RBX_Alt_Manager
                     {
                         try
                         {
+                            int processId = 0;
+                            try { processId = process.Id; } catch { }
+                            if (ignoredProcessId > 0 && processId == ignoredProcessId)
+                                continue;
+
                             if (!TryGetProcessMainWindowHandle(process, out IntPtr mainWindowHandle))
                                 continue;
 
                             string commandLine = string.Empty;
                             try { commandLine = process.GetCommandLine() ?? string.Empty; } catch { }
                             bool trackerMatched = false;
+                            bool launchedAfterCurrentRequest = true;
+
+                            if (LastAppLaunch != DateTime.MinValue && TryGetProcessStartTimeUtc(process, out DateTime processStartUtc))
+                                launchedAfterCurrentRequest = processStartUtc >= LastAppLaunch.AddSeconds(-2);
 
                             if (!string.IsNullOrWhiteSpace(BrowserTrackerID) && !string.IsNullOrWhiteSpace(commandLine))
                             {
@@ -992,10 +1060,20 @@ namespace RBX_Alt_Manager
                                 }
                             }
 
+                            if (!trackerMatched && CurrentProcessId > 0 && processId == CurrentProcessId && launchedAfterCurrentRequest)
+                                trackerMatched = true;
+
+                            if (trackerMatched && !launchedAfterCurrentRequest)
+                                continue;
+
+                            if (allowSingleFallback && !trackerMatched && !launchedAfterCurrentRequest)
+                                continue;
+
                             if (!trackerMatched && !allowSingleFallback)
                                 continue;
 
                             Found = true;
+                            LastTinyLaunchSlot = slot;
 
                             try
                             {
