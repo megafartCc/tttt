@@ -293,7 +293,7 @@ namespace RBX_Alt_Manager
             return 0;
         }
 
-        private bool HasFreshPlaceJoinSignal(long expectedPlaceId)
+        private bool HasFreshPlaceJoinSignal(long expectedPlaceId, int matchedProcessId, int previousProcessId)
         {
             if (expectedPlaceId <= 0)
                 return true;
@@ -303,6 +303,15 @@ namespace RBX_Alt_Manager
 
             if (LastAppLaunch == DateTime.MinValue)
                 return true;
+
+            if (CurrentProcessId > 0)
+            {
+                if (matchedProcessId > 0 && CurrentProcessId == matchedProcessId)
+                    return true;
+
+                if (previousProcessId > 0 && CurrentProcessId != previousProcessId)
+                    return true;
+            }
 
             if (LastLiveStatusUpdateUtc == DateTime.MinValue)
                 return false;
@@ -1087,7 +1096,7 @@ namespace RBX_Alt_Manager
                             if (!trackerMatched && !allowSingleFallback)
                                 continue;
 
-                            if (!HasFreshPlaceJoinSignal(expectedPlaceId))
+                            if (!HasFreshPlaceJoinSignal(expectedPlaceId, processId, ignoredProcessId))
                                 continue;
 
                             Found = true;
