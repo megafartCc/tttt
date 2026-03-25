@@ -47,6 +47,8 @@ namespace RBX_Alt_Manager
         [DllImport("user32.dll", SetLastError = true)]
         static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
         [DllImport("user32.dll", SetLastError = true)]
+        static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+        [DllImport("user32.dll", SetLastError = true)]
         static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
         [DllImport("user32.dll", EntryPoint = "GetWindowLong", SetLastError = true)]
         static extern int GetWindowLong32(IntPtr hWnd, int nIndex);
@@ -82,7 +84,16 @@ namespace RBX_Alt_Manager
         private const uint SWP_FRAMECHANGED = 0x0020;
         private const uint SWP_SHOWWINDOW = 0x0040;
         private static readonly object TinyLaunchSlotLock = new object();
-        private static int NextTinyLaunchSlot = -1;
+        private static readonly HashSet<int> PendingTinyLaunchSlots = new HashSet<int>();
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+        }
 
         private static int GetWindowStyle(IntPtr handle)
         {
@@ -100,42 +111,28 @@ namespace RBX_Alt_Manager
                 _ = SetWindowLong32(handle, GWL_STYLE, style);
         }
 
-        private static int AcquireTinyLaunchSlot()
+        private static bool TryGetProcessMainWindowHandle(Process process, out IntPtr mainWindowHandle)
         {
-            lock (TinyLaunchSlotLock)
+            mainWindowHandle = IntPtr.Zero;
+
+            if (process == null)
+                return false;
+
+            try
             {
-                bool anyOpenInstance = false;
-                Process[] processSnapshot;
+                if (process.HasExited)
+                    return false;
 
-                try { processSnapshot = Process.GetProcessesByName("RobloxPlayerBeta"); }
-                catch { processSnapshot = Array.Empty<Process>(); }
-
-                foreach (Process process in processSnapshot)
-                {
-                    try
-                    {
-                        if (process != null && !process.HasExited)
-                        {
-                            anyOpenInstance = true;
-                            break;
-                        }
-                    }
-                    catch { }
-                    finally
-                    {
-                        try { process.Dispose(); } catch { }
-                    }
-                }
-
-                if (!anyOpenInstance)
-                    NextTinyLaunchSlot = -1;
-
-                NextTinyLaunchSlot++;
-                return NextTinyLaunchSlot;
+                mainWindowHandle = process.MainWindowHandle;
+                return mainWindowHandle != IntPtr.Zero;
+            }
+            catch
+            {
+                return false;
             }
         }
 
-        private static (int PosX, int PosY) GetTinyLaunchGridPosition(int slot)
+        private static (Rectangle WorkingArea, int CellWidth, int CellHeight, int Columns, int Rows, int TotalSlots) GetTinyLaunchGridLayout()
         {
             Rectangle workingArea = Screen.PrimaryScreen?.WorkingArea
                 ?? Screen.AllScreens.FirstOrDefault()?.WorkingArea
@@ -146,11 +143,97 @@ namespace RBX_Alt_Manager
             int columns = Math.Max(1, (Math.Max(workingArea.Width, TinyLaunchWidth) + TinyLaunchGapX) / cellWidth);
             int rows = Math.Max(1, (Math.Max(workingArea.Height, TinyLaunchHeight) + TinyLaunchGapY) / cellHeight);
             int totalSlots = Math.Max(1, columns * rows);
-            int normalizedSlot = slot % totalSlots;
-            int column = normalizedSlot % columns;
-            int row = normalizedSlot / columns;
-            int posX = workingArea.Left + TinyLaunchPosX + (column * cellWidth);
-            int posY = workingArea.Top + TinyLaunchPosY + (row * cellHeight);
+
+            return (workingArea, cellWidth, cellHeight, columns, rows, totalSlots);
+        }
+
+        private static bool TryGetTinyLaunchSlotFromRect(RECT rect, out int slot)
+        {
+            slot = -1;
+
+            Rectangle bounds = Rectangle.FromLTRB(rect.Left, rect.Top, rect.Right, rect.Bottom);
+            var layout = GetTinyLaunchGridLayout();
+            int originX = layout.WorkingArea.Left + TinyLaunchPosX;
+            int originY = layout.WorkingArea.Top + TinyLaunchPosY;
+            double relativeX = bounds.Left - originX;
+            double relativeY = bounds.Top - originY;
+            int column = (int)Math.Round(relativeX / Math.Max(1d, layout.CellWidth));
+            int row = (int)Math.Round(relativeY / Math.Max(1d, layout.CellHeight));
+
+            if (column < 0 || column >= layout.Columns || row < 0 || row >= layout.Rows)
+                return false;
+
+            int expectedX = originX + (column * layout.CellWidth);
+            int expectedY = originY + (row * layout.CellHeight);
+            int toleranceX = Math.Max(8, TinyLaunchGapX + 6);
+            int toleranceY = Math.Max(8, TinyLaunchGapY + 6);
+
+            if (Math.Abs(bounds.Left - expectedX) > toleranceX || Math.Abs(bounds.Top - expectedY) > toleranceY)
+                return false;
+
+            slot = (row * layout.Columns) + column;
+            return slot >= 0 && slot < layout.TotalSlots;
+        }
+
+        private static int AcquireTinyLaunchSlot()
+        {
+            lock (TinyLaunchSlotLock)
+            {
+                var layout = GetTinyLaunchGridLayout();
+                HashSet<int> occupiedSlots = new HashSet<int>(PendingTinyLaunchSlots);
+                Process[] processSnapshot;
+
+                try { processSnapshot = Process.GetProcessesByName("RobloxPlayerBeta"); }
+                catch { processSnapshot = Array.Empty<Process>(); }
+
+                foreach (Process process in processSnapshot)
+                {
+                    try
+                    {
+                        if (!TryGetProcessMainWindowHandle(process, out IntPtr mainWindowHandle))
+                            continue;
+
+                        if (GetWindowRect(mainWindowHandle, out RECT rect) && TryGetTinyLaunchSlotFromRect(rect, out int liveSlot))
+                            occupiedSlots.Add(liveSlot);
+                    }
+                    catch { }
+                    finally
+                    {
+                        try { process.Dispose(); } catch { }
+                    }
+                }
+
+                for (int slot = 0; slot < layout.TotalSlots; slot++)
+                {
+                    if (occupiedSlots.Contains(slot))
+                        continue;
+
+                    PendingTinyLaunchSlots.Add(slot);
+                    return slot;
+                }
+
+                int fallbackSlot = 0;
+                PendingTinyLaunchSlots.Add(fallbackSlot);
+                return fallbackSlot;
+            }
+        }
+
+        private static void ReleaseTinyLaunchSlot(int slot)
+        {
+            lock (TinyLaunchSlotLock)
+            {
+                PendingTinyLaunchSlots.Remove(slot);
+            }
+        }
+
+        private static (int PosX, int PosY) GetTinyLaunchGridPosition(int slot)
+        {
+            var layout = GetTinyLaunchGridLayout();
+            int normalizedSlot = slot % layout.TotalSlots;
+            int column = normalizedSlot % layout.Columns;
+            int row = normalizedSlot / layout.Columns;
+            int posX = layout.WorkingArea.Left + TinyLaunchPosX + (column * layout.CellWidth);
+            int posY = layout.WorkingArea.Top + TinyLaunchPosY + (row * layout.CellHeight);
 
             return (posX, posY);
         }
@@ -849,139 +932,160 @@ namespace RBX_Alt_Manager
 
         public async void AdjustWindowPosition()
         {
-            int slot = AcquireTinyLaunchSlot();
-            (int PosX, int PosY) = GetTinyLaunchGridPosition(slot);
-            int Width = TinyLaunchWidth;
-            int Height = TinyLaunchHeight;
+            int slot = -1;
+            bool slotReleased = false;
 
-            bool Found = false;
-            DateTime SearchEnds = DateTime.Now.AddSeconds(45);
-            DateTime EnforceEnds = DateTime.MinValue;
-
-            while (true)
+            try
             {
-                await Task.Delay(350);
+                slot = AcquireTinyLaunchSlot();
+                (int PosX, int PosY) = GetTinyLaunchGridPosition(slot);
+                int Width = TinyLaunchWidth;
+                int Height = TinyLaunchHeight;
 
-                Process[] processSnapshot;
-                try { processSnapshot = Process.GetProcessesByName("RobloxPlayerBeta"); }
-                catch { processSnapshot = Array.Empty<Process>(); }
+                bool Found = false;
+                DateTime SearchEnds = DateTime.Now.AddSeconds(45);
+                DateTime EnforceEnds = DateTime.MinValue;
 
-                var orderedProcesses = processSnapshot
-                    .OrderByDescending(process =>
-                    {
-                        try { return process.StartTime; }
-                        catch { return DateTime.MinValue; }
-                    })
-                    .ToList();
-
-                bool allowSingleFallback =
-                    orderedProcesses.Count == 1
-                    && LastAppLaunch != DateTime.MinValue
-                    && (DateTime.UtcNow - LastAppLaunch) <= TimeSpan.FromSeconds(35);
-
-                foreach (Process process in orderedProcesses)
+                while (true)
                 {
-                    try
+                    await Task.Delay(350);
+
+                    Process[] processSnapshot;
+                    try { processSnapshot = Process.GetProcessesByName("RobloxPlayerBeta"); }
+                    catch { processSnapshot = Array.Empty<Process>(); }
+
+                    var orderedProcesses = processSnapshot
+                        .OrderByDescending(process =>
+                        {
+                            try { return process.StartTime; }
+                            catch { return DateTime.MinValue; }
+                        })
+                        .ToList();
+
+                    bool allowSingleFallback =
+                        orderedProcesses.Count == 1
+                        && LastAppLaunch != DateTime.MinValue
+                        && (DateTime.UtcNow - LastAppLaunch) <= TimeSpan.FromSeconds(35);
+
+                    foreach (Process process in orderedProcesses)
                     {
-                        if (process == null || process.HasExited || process.MainWindowHandle == IntPtr.Zero)
-                            continue;
-
-                        string commandLine = string.Empty;
-                        try { commandLine = process.GetCommandLine() ?? string.Empty; } catch { }
-                        bool trackerMatched = false;
-
-                        if (!string.IsNullOrWhiteSpace(BrowserTrackerID) && !string.IsNullOrWhiteSpace(commandLine))
+                        try
                         {
-                            if (commandLine.IndexOf(BrowserTrackerID, StringComparison.OrdinalIgnoreCase) >= 0)
+                            if (!TryGetProcessMainWindowHandle(process, out IntPtr mainWindowHandle))
+                                continue;
+
+                            string commandLine = string.Empty;
+                            try { commandLine = process.GetCommandLine() ?? string.Empty; } catch { }
+                            bool trackerMatched = false;
+
+                            if (!string.IsNullOrWhiteSpace(BrowserTrackerID) && !string.IsNullOrWhiteSpace(commandLine))
                             {
-                                trackerMatched = true;
+                                if (commandLine.IndexOf(BrowserTrackerID, StringComparison.OrdinalIgnoreCase) >= 0)
+                                {
+                                    trackerMatched = true;
+                                }
+                                else
+                                {
+                                    Match trackerMatch = Regex.Match(commandLine, @"(?:\s-b\s+|browsertrackerid[:=\s]+)(\d+)", RegexOptions.IgnoreCase);
+                                    string trackerId = trackerMatch.Success ? trackerMatch.Groups[1].Value : string.Empty;
+                                    trackerMatched = string.Equals(trackerId, BrowserTrackerID, StringComparison.Ordinal);
+                                }
                             }
-                            else
+
+                            if (!trackerMatched && !allowSingleFallback)
+                                continue;
+
+                            Found = true;
+
+                            try
                             {
-                                Match trackerMatch = Regex.Match(commandLine, @"(?:\s-b\s+|browsertrackerid[:=\s]+)(\d+)", RegexOptions.IgnoreCase);
-                                string trackerId = trackerMatch.Success ? trackerMatch.Groups[1].Value : string.Empty;
-                                trackerMatched = string.Equals(trackerId, BrowserTrackerID, StringComparison.Ordinal);
+                                AccountManager.Instance?.ApplyRobloxProcessOptimization(process);
                             }
+                            catch { }
+
+                            try
+                            {
+                                EmptyWorkingSet(process.Handle);
+                            }
+                            catch { }
+
+                            try
+                            {
+                                int style = GetWindowStyle(mainWindowHandle);
+                                int compactStyle = (style & ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU)) | WS_POPUP;
+                                if (compactStyle != style)
+                                    SetWindowStyle(mainWindowHandle, compactStyle);
+
+                                _ = SetWindowPos(
+                                    mainWindowHandle,
+                                    IntPtr.Zero,
+                                    PosX,
+                                    PosY,
+                                    Width,
+                                    Height,
+                                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+                            }
+                            catch
+                            {
+                                MoveWindow(mainWindowHandle, PosX, PosY, Width, Height, true);
+                            }
+
+                            ShowWindow(mainWindowHandle, SW_SHOWNOACTIVATE);
+
+                            if (!slotReleased)
+                            {
+                                ReleaseTinyLaunchSlot(slot);
+                                slotReleased = true;
+                            }
+
+                            try
+                            {
+                                if (!string.IsNullOrWhiteSpace(Username))
+                                    SetWindowText(mainWindowHandle, Username);
+                            }
+                            catch { }
+
+                            try
+                            {
+                                process.PriorityBoostEnabled = false;
+                                if (process.PriorityClass != ProcessPriorityClass.BelowNormal)
+                                    process.PriorityClass = ProcessPriorityClass.BelowNormal;
+                            }
+                            catch { }
+
+                            try
+                            {
+                                EmptyWorkingSet(process.Handle);
+                            }
+                            catch { }
+
+                            DateTime extendEnforce = DateTime.Now.AddSeconds(12);
+                            if (extendEnforce > EnforceEnds)
+                                EnforceEnds = extendEnforce;
+
+                            break;
                         }
-
-                        if (!trackerMatched && !allowSingleFallback)
-                            continue;
-
-                        Found = true;
-
-                        try
+                        finally
                         {
-                            AccountManager.Instance?.ApplyRobloxProcessOptimization(process);
+                            try { process.Dispose(); } catch { }
                         }
-                        catch { }
+                    }
 
-                        try
-                        {
-                            EmptyWorkingSet(process.Handle);
-                        }
-                        catch { }
-
-                        try
-                        {
-                            int style = GetWindowStyle(process.MainWindowHandle);
-                            int compactStyle = (style & ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU)) | WS_POPUP;
-                            if (compactStyle != style)
-                                SetWindowStyle(process.MainWindowHandle, compactStyle);
-
-                            _ = SetWindowPos(
-                                process.MainWindowHandle,
-                                IntPtr.Zero,
-                                PosX,
-                                PosY,
-                                Width,
-                                Height,
-                                SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
-                        }
-                        catch
-                        {
-                            MoveWindow(process.MainWindowHandle, PosX, PosY, Width, Height, true);
-                        }
-
-                        ShowWindow(process.MainWindowHandle, SW_SHOWNOACTIVATE);
-
-                        try
-                        {
-                            if (!string.IsNullOrWhiteSpace(Username))
-                                SetWindowText(process.MainWindowHandle, Username);
-                        }
-                        catch { }
-
-                        try
-                        {
-                            process.PriorityBoostEnabled = false;
-                            if (process.PriorityClass != ProcessPriorityClass.BelowNormal)
-                                process.PriorityClass = ProcessPriorityClass.BelowNormal;
-                        }
-                        catch { }
-
-                        try
-                        {
-                            EmptyWorkingSet(process.Handle);
-                        }
-                        catch { }
-
-                        DateTime extendEnforce = DateTime.Now.AddSeconds(12);
-                        if (extendEnforce > EnforceEnds)
-                            EnforceEnds = extendEnforce;
-
+                    if (!Found && DateTime.Now > SearchEnds)
                         break;
-                    }
-                    finally
-                    {
-                        try { process.Dispose(); } catch { }
-                    }
+
+                    if (Found && DateTime.Now > EnforceEnds)
+                        break;
                 }
-
-                if (!Found && DateTime.Now > SearchEnds)
-                    break;
-
-                if (Found && DateTime.Now > EnforceEnds)
-                    break;
+            }
+            catch (Exception ex)
+            {
+                Program.Logger.Error($"[AdjustWindowPosition] Failed for {Username}: {ex}");
+            }
+            finally
+            {
+                if (!slotReleased && slot >= 0)
+                    ReleaseTinyLaunchSlot(slot);
             }
         }
 
