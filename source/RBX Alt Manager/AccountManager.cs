@@ -1720,6 +1720,8 @@ namespace RBX_Alt_Manager
 
                 if (ResolvedPid > 0)
                 {
+                    account.RememberTinyLaunchSlotFromProcess(ResolvedPid);
+                    account.SetPendingTinyLaunchIgnoredProcessId(ResolvedPid);
                     Program.Logger.Info($"[AutoRejoin] Terminating PID {ResolvedPid} for {account.Username}.");
                     ClosedAny = await TryTerminatePidForAutoRejoin(ResolvedPid);
 
@@ -1743,6 +1745,8 @@ namespace RBX_Alt_Manager
                             if (!string.Equals(TrackerID, account.BrowserTrackerID, StringComparison.Ordinal))
                                 continue;
 
+                            account.RememberTinyLaunchSlotFromProcess(process.Id);
+                            account.SetPendingTinyLaunchIgnoredProcessId(process.Id);
                             Program.Logger.Info($"[AutoRejoin] Fallback terminate PID {process.Id} for {account.Username} via tracker match.");
                             if (await TryTerminatePidForAutoRejoin(process.Id))
                             {

@@ -44,6 +44,7 @@ namespace RBX_Alt_Manager
         [JsonIgnore] public DateTime LastLiveStatusUpdateUtc = DateTime.MinValue;
         [JsonIgnore] public int CurrentProcessId;
         [JsonIgnore] private int LastTinyLaunchSlot = -1;
+        [JsonIgnore] private int PendingTinyLaunchIgnoredProcessId = 0;
 
         [DllImport("user32.dll", SetLastError = true)]
         static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
@@ -70,6 +71,7 @@ namespace RBX_Alt_Manager
         private const int TinyLaunchHeight = 54;
         private const int TinyLaunchGapX = 2;
         private const int TinyLaunchGapY = 2;
+        private const int SW_HIDE = 0;
         private const int SW_SHOWNOACTIVATE = 4;
         private const int GWL_STYLE = -16;
         private const int WS_CAPTION = 0x00C00000;
@@ -291,6 +293,48 @@ namespace RBX_Alt_Manager
             catch { }
 
             return 0;
+        }
+
+        public void RememberTinyLaunchSlotFromProcess(int processId = 0)
+        {
+            int targetPid = processId > 0 ? processId : CurrentProcessId;
+            if (targetPid <= 0)
+                return;
+
+            try
+            {
+                using (Process process = Process.GetProcessById(targetPid))
+                {
+                    if (!TryGetProcessMainWindowHandle(process, out IntPtr mainWindowHandle))
+                        return;
+
+                    if (GetWindowRect(mainWindowHandle, out RECT rect) && TryGetTinyLaunchSlotFromRect(rect, out int liveSlot))
+                        LastTinyLaunchSlot = liveSlot;
+                }
+            }
+            catch { }
+        }
+
+        public void SetPendingTinyLaunchIgnoredProcessId(int processId)
+        {
+            PendingTinyLaunchIgnoredProcessId = processId > 0 ? processId : 0;
+        }
+
+        private int GetTinyLaunchIgnoredProcessId()
+        {
+            if (CurrentProcessId > 0)
+                return CurrentProcessId;
+
+            if (PendingTinyLaunchIgnoredProcessId > 0)
+                return PendingTinyLaunchIgnoredProcessId;
+
+            return FindTrackedRobloxProcessId();
+        }
+
+        private void ClearPendingTinyLaunchIgnoredProcessId(int processId)
+        {
+            if (processId > 0 && PendingTinyLaunchIgnoredProcessId == processId)
+                PendingTinyLaunchIgnoredProcessId = 0;
         }
 
         private bool HasFreshPlaceJoinSignal(long expectedPlaceId, int matchedProcessId, int previousProcessId)
@@ -828,7 +872,7 @@ namespace RBX_Alt_Manager
                 BrowserTrackerID = trackerId; // Persisted through normal SaveAccounts flow later.
             }
 
-            int ignoredProcessId = CurrentProcessId > 0 ? CurrentProcessId : FindTrackedRobloxProcessId();
+            int ignoredProcessId = GetTinyLaunchIgnoredProcessId();
 
             try { ClientSettingsPatcher.PatchSettings(); } catch (Exception Ex) { Program.Logger.Error($"Failed to patch ClientAppSettings: {Ex}"); }
 
@@ -1031,7 +1075,7 @@ namespace RBX_Alt_Manager
 
                 while (true)
                 {
-                    await Task.Delay(350);
+                    await Task.Delay(Found ? 500 : 150);
 
                     Process[] processSnapshot;
                     try { processSnapshot = Process.GetProcessesByName("RobloxPlayerBeta"); }
@@ -1096,23 +1140,22 @@ namespace RBX_Alt_Manager
                             if (!trackerMatched && !allowSingleFallback)
                                 continue;
 
-                            if (!HasFreshPlaceJoinSignal(expectedPlaceId, processId, ignoredProcessId))
-                                continue;
+                            bool readyForTinyShow = HasFreshPlaceJoinSignal(expectedPlaceId, processId, ignoredProcessId);
+                            if (!readyForTinyShow)
+                            {
+                                try
+                                {
+                                    ShowWindow(mainWindowHandle, SW_HIDE);
+                                }
+                                catch { }
+
+                                if (DateTime.Now <= SearchEnds)
+                                    continue;
+                            }
 
                             Found = true;
                             LastTinyLaunchSlot = slot;
-
-                            try
-                            {
-                                AccountManager.Instance?.ApplyRobloxProcessOptimization(process);
-                            }
-                            catch { }
-
-                            try
-                            {
-                                EmptyWorkingSet(process.Handle);
-                            }
-                            catch { }
+                            ClearPendingTinyLaunchIgnoredProcessId(ignoredProcessId);
 
                             try
                             {
@@ -1128,7 +1171,7 @@ namespace RBX_Alt_Manager
                                     PosY,
                                     Width,
                                     Height,
-                                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+                                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
                             }
                             catch
                             {
@@ -1151,13 +1194,7 @@ namespace RBX_Alt_Manager
                             }
                             catch { }
 
-                            try
-                            {
-                                EmptyWorkingSet(process.Handle);
-                            }
-                            catch { }
-
-                            DateTime extendEnforce = DateTime.Now.AddSeconds(12);
+                            DateTime extendEnforce = DateTime.Now.AddSeconds(3);
                             if (extendEnforce > EnforceEnds)
                                 EnforceEnds = extendEnforce;
 
@@ -1182,6 +1219,8 @@ namespace RBX_Alt_Manager
             }
             finally
             {
+                ClearPendingTinyLaunchIgnoredProcessId(ignoredProcessId);
+
                 if (!slotReleased && slot >= 0)
                     ReleaseTinyLaunchSlot(slot);
             }
