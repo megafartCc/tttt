@@ -107,7 +107,9 @@ local SHARED_IGNORE_FILE = "ignorelist_shared_" .. tostring(TargetPlaceId) .. ".
 local ENABLE_SHARED_CROSS_ACCOUNT_BLOCKLIST = true
 local SHARED_SERVER_BLOCK_SECONDS = 300
 local SHARED_IGNORE_REFRESH_SECONDS = 0.5
-local SHARED_SERVER_CLAIM_WAIT_SECONDS = 0.08
+local SHARED_SERVER_CLAIM_WAIT_SECONDS = 0.18
+local SHARED_SERVER_CLAIM_STABILITY_SECONDS = 0.18
+local SHARED_SERVER_CLAIM_POLL_INTERVAL = 0.03
 local SHARED_SERVER_CLAIM_FILE_PREFIX = "server_claim_" .. tostring(TargetPlaceId) .. "_"
 local SHARED_SERVER_CLAIM_FILE = "server_claims_shared_" .. tostring(TargetPlaceId) .. ".json"
 local CLEANUP_LEGACY_SERVER_CLAIM_FILES = true
@@ -137,6 +139,7 @@ local lastRamStatusPushErrorAt = 0
 local cachedPlaceName = ""
 local cachedPlaceNamePlaceId = nil
 local cachedPlaceNameLookupAt = 0
+local sharedClaimTokenByJobId = {}
 local function createSharedClaimOwner()
     local userTag = tostring(LocalPlayer.UserId or "0")
     if HttpService and type(HttpService.GenerateGUID) == "function" then
@@ -152,6 +155,26 @@ local function createSharedClaimOwner()
         .. tostring(math.random(100000, 999999))
 end
 local SHARED_SERVER_CLAIM_OWNER = createSharedClaimOwner()
+local RAM_SHARED_CLAIM_SENTINEL = "__ram_claim__"
+
+local function hashJoinerSeed(value)
+    local text = tostring(value or "")
+    local hash = 0
+    for i = 1, #text do
+        hash = ((hash * 131) + string.byte(text, i)) % 2147483647
+    end
+    if hash <= 0 then
+        hash = 1
+    end
+    return hash
+end
+
+local JOINER_INSTANCE_SEED = hashJoinerSeed(table.concat({
+    tostring(LocalPlayer.UserId or "0"),
+    tostring(game.JobId or ""),
+    tostring(os.clock()),
+    SHARED_SERVER_CLAIM_OWNER,
+}, "|"))
 
 local function getNowSeconds()
     return os.time()
@@ -994,6 +1017,8 @@ local function readSharedServerClaimStore()
                 cleaned[jobId] = {
                     owner = owner,
                     expiresAt = expiresAt,
+                    token = tostring(payload.token or ""),
+                    claimedAt = tonumber(payload.claimedAt) or nowSeconds,
                 }
             end
         end
@@ -1027,18 +1052,40 @@ end
 local function writeSharedServerClaim(jobId)
     jobId = tostring(jobId or "")
     if jobId == "" then
-        return false
+        return false, "invalid_job"
     end
 
     local store = readSharedServerClaimStore()
+    local nowSeconds = getNowSeconds()
+    local existing = store.claims[jobId]
+    if type(existing) == "table" then
+        local existingOwner = tostring(existing.owner or "")
+        local existingExpiresAt = tonumber(existing.expiresAt)
+        if existingOwner ~= "" and type(existingExpiresAt) == "number" and existingExpiresAt > nowSeconds and existingOwner ~= SHARED_SERVER_CLAIM_OWNER then
+            return false, "owned_by_other"
+        end
+    end
+
+    local claimToken = table.concat({
+        sanitizeJobIdForFile(jobId),
+        tostring(nowSeconds),
+        tostring(math.floor(os.clock() * 1000000)),
+        tostring(JOINER_INSTANCE_SEED),
+        tostring(math.random(100000, 999999)),
+    }, "_")
     store.claims[jobId] = {
         owner = SHARED_SERVER_CLAIM_OWNER,
-        expiresAt = getNowSeconds() + math.max(1, tonumber(SHARED_SERVER_BLOCK_SECONDS) or JOINER_SERVER_BLOCK_SECONDS),
+        token = claimToken,
+        claimedAt = nowSeconds,
+        expiresAt = nowSeconds + math.max(1, tonumber(SHARED_SERVER_BLOCK_SECONDS) or JOINER_SERVER_BLOCK_SECONDS),
     }
-    return writeSharedServerClaimStore(store)
+    if not writeSharedServerClaimStore(store) then
+        return false, "write_failed"
+    end
+    return true, claimToken
 end
 
-local function isSharedServerClaimOwnedBySelf(jobId)
+local function isSharedServerClaimOwnedBySelf(jobId, expectedToken)
     jobId = tostring(jobId or "")
     if jobId == "" then
         return false
@@ -1055,7 +1102,43 @@ local function isSharedServerClaimOwnedBySelf(jobId)
         return false
     end
 
-    return tostring(claim.owner or "") == SHARED_SERVER_CLAIM_OWNER
+    if tostring(claim.owner or "") ~= SHARED_SERVER_CLAIM_OWNER then
+        return false
+    end
+    if type(expectedToken) == "string" and expectedToken ~= "" then
+        return tostring(claim.token or "") == expectedToken
+    end
+    return true
+end
+
+local function waitForSharedServerClaimStability(jobId, claimToken)
+    jobId = tostring(jobId or "")
+    claimToken = tostring(claimToken or "")
+    if jobId == "" or claimToken == "" then
+        return false
+    end
+
+    local stableFor = math.max(0.05, tonumber(SHARED_SERVER_CLAIM_STABILITY_SECONDS) or 0.18)
+    local pollEvery = math.max(0.01, tonumber(SHARED_SERVER_CLAIM_POLL_INTERVAL) or 0.03)
+    local deadline = tick() + math.max(
+        tonumber(SHARED_SERVER_CLAIM_WAIT_SECONDS) or 0.18,
+        stableFor + pollEvery
+    )
+    local stableStartedAt = nil
+
+    while tick() <= deadline do
+        if not isSharedServerClaimOwnedBySelf(jobId, claimToken) then
+            return false
+        end
+        if stableStartedAt == nil then
+            stableStartedAt = tick()
+        elseif (tick() - stableStartedAt) >= stableFor then
+            return true
+        end
+        task.wait(pollEvery)
+    end
+
+    return isSharedServerClaimOwnedBySelf(jobId, claimToken)
 end
 
 local function loadIgnoreList()
@@ -1269,21 +1352,37 @@ local function tryClaimServerForHop(jobId)
         return false
     end
 
-    if not writeSharedServerClaim(jobId) then
+    if RAM_SERVER_CLAIM_ENABLED then
+        local ramClaimed, ramOwnerOrReason = tryClaimServerViaRam(jobId)
+        if ramClaimed == true then
+            sharedClaimTokenByJobId[jobId] = RAM_SHARED_CLAIM_SENTINEL
+            markServerBlocked(jobId, math.max(1, tonumber(SHARED_SERVER_BLOCK_SECONDS) or JOINER_SERVER_BLOCK_SECONDS))
+            return true
+        elseif ramClaimed == false then
+            joinerDebugWarn("ram claim rejected target=" .. jobId .. " owner=" .. tostring(ramOwnerOrReason))
+            return false
+        end
+    end
+
+    local wroteClaim, claimTokenOrReason = writeSharedServerClaim(jobId)
+    if not wroteClaim then
         return false
     end
 
-    task.wait(math.max(0, tonumber(SHARED_SERVER_CLAIM_WAIT_SECONDS) or 0.08))
-    if not isSharedServerClaimOwnedBySelf(jobId) then
+    local claimToken = tostring(claimTokenOrReason or "")
+    if not waitForSharedServerClaimStability(jobId, claimToken) then
+        sharedClaimTokenByJobId[jobId] = nil
         return false
     end
 
+    sharedClaimTokenByJobId[jobId] = claimToken
     markServerBlocked(jobId, math.max(1, tonumber(SHARED_SERVER_BLOCK_SECONDS) or JOINER_SERVER_BLOCK_SECONDS))
 
     -- Final ownership check to avoid teleport races where another instance overrides the claim
     -- between our initial claim-read and the actual teleport call.
     task.wait(0.03)
-    if not isSharedServerClaimOwnedBySelf(jobId) then
+    if not isSharedServerClaimOwnedBySelf(jobId, claimToken) then
+        sharedClaimTokenByJobId[jobId] = nil
         return false
     end
 
@@ -1469,7 +1568,7 @@ local function shuffleListInPlace(list)
     end
 
     joinerShuffleNonce = joinerShuffleNonce + 1
-    local baseSeed = (tonumber(LocalPlayer.UserId) or 0) + math.floor(os.clock() * 1000) + (joinerShuffleNonce * 97)
+    local baseSeed = JOINER_INSTANCE_SEED + math.floor(os.clock() * 1000) + (joinerShuffleNonce * 97)
     local rng = Random.new(baseSeed)
 
     for i = #list, 2, -1 do
@@ -2244,9 +2343,11 @@ local function attemptTeleportToServer(placeId, serverJobId, sourceLabel)
 
     if ENABLE_SHARED_CROSS_ACCOUNT_BLOCKLIST then
         refreshSharedIgnoreMapIfNeeded(true)
-        if not isSharedServerClaimOwnedBySelf(serverJobId) then
+        local claimToken = sharedClaimTokenByJobId[serverJobId]
+        if claimToken ~= RAM_SHARED_CLAIM_SENTINEL and not isSharedServerClaimOwnedBySelf(serverJobId, claimToken) then
             joinerDebugWarn("teleport aborted (claim lost) target=" .. serverJobId)
             markServerBlocked(serverJobId, math.max(1, tonumber(SHARED_SERVER_BLOCK_SECONDS) or JOINER_SERVER_BLOCK_SECONDS))
+            sharedClaimTokenByJobId[serverJobId] = nil
             return false
         end
     end
