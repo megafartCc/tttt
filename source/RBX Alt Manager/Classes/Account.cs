@@ -6,6 +6,7 @@ using RestSharp;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -66,7 +67,9 @@ namespace RBX_Alt_Manager
         private const int TinyLaunchPosY = 0;
         private const int TinyLaunchWidth = 96;
         private const int TinyLaunchHeight = 54;
-        private const int SW_MINIMIZE = 6;
+        private const int TinyLaunchGapX = 2;
+        private const int TinyLaunchGapY = 2;
+        private const int SW_SHOWNOACTIVATE = 4;
         private const int GWL_STYLE = -16;
         private const int WS_CAPTION = 0x00C00000;
         private const int WS_THICKFRAME = 0x00040000;
@@ -78,6 +81,8 @@ namespace RBX_Alt_Manager
         private const uint SWP_NOACTIVATE = 0x0010;
         private const uint SWP_FRAMECHANGED = 0x0020;
         private const uint SWP_SHOWWINDOW = 0x0040;
+        private static readonly object TinyLaunchSlotLock = new object();
+        private static int NextTinyLaunchSlot = -1;
 
         private static int GetWindowStyle(IntPtr handle)
         {
@@ -93,6 +98,61 @@ namespace RBX_Alt_Manager
                 _ = SetWindowLongPtr64(handle, GWL_STYLE, new IntPtr(style));
             else
                 _ = SetWindowLong32(handle, GWL_STYLE, style);
+        }
+
+        private static int AcquireTinyLaunchSlot()
+        {
+            lock (TinyLaunchSlotLock)
+            {
+                bool anyOpenInstance = false;
+                Process[] processSnapshot;
+
+                try { processSnapshot = Process.GetProcessesByName("RobloxPlayerBeta"); }
+                catch { processSnapshot = Array.Empty<Process>(); }
+
+                foreach (Process process in processSnapshot)
+                {
+                    try
+                    {
+                        if (process != null && !process.HasExited)
+                        {
+                            anyOpenInstance = true;
+                            break;
+                        }
+                    }
+                    catch { }
+                    finally
+                    {
+                        try { process.Dispose(); } catch { }
+                    }
+                }
+
+                if (!anyOpenInstance)
+                    NextTinyLaunchSlot = -1;
+
+                NextTinyLaunchSlot++;
+                return NextTinyLaunchSlot;
+            }
+        }
+
+        private static (int PosX, int PosY) GetTinyLaunchGridPosition(int slot)
+        {
+            Rectangle workingArea = Screen.PrimaryScreen?.WorkingArea
+                ?? Screen.AllScreens.FirstOrDefault()?.WorkingArea
+                ?? new Rectangle(TinyLaunchPosX, TinyLaunchPosY, TinyLaunchWidth, TinyLaunchHeight);
+
+            int cellWidth = TinyLaunchWidth + TinyLaunchGapX;
+            int cellHeight = TinyLaunchHeight + TinyLaunchGapY;
+            int columns = Math.Max(1, (Math.Max(workingArea.Width, TinyLaunchWidth) + TinyLaunchGapX) / cellWidth);
+            int rows = Math.Max(1, (Math.Max(workingArea.Height, TinyLaunchHeight) + TinyLaunchGapY) / cellHeight);
+            int totalSlots = Math.Max(1, columns * rows);
+            int normalizedSlot = slot % totalSlots;
+            int column = normalizedSlot % columns;
+            int row = normalizedSlot / columns;
+            int posX = workingArea.Left + TinyLaunchPosX + (column * cellWidth);
+            int posY = workingArea.Top + TinyLaunchPosY + (row * cellHeight);
+
+            return (posX, posY);
         }
 
         private static int GetSecureRandomNumber(int minInclusive, int maxExclusive)
@@ -789,8 +849,8 @@ namespace RBX_Alt_Manager
 
         public async void AdjustWindowPosition()
         {
-            int PosX = TinyLaunchPosX;
-            int PosY = TinyLaunchPosY;
+            int slot = AcquireTinyLaunchSlot();
+            (int PosX, int PosY) = GetTinyLaunchGridPosition(slot);
             int Width = TinyLaunchWidth;
             int Height = TinyLaunchHeight;
 
@@ -882,7 +942,7 @@ namespace RBX_Alt_Manager
                             MoveWindow(process.MainWindowHandle, PosX, PosY, Width, Height, true);
                         }
 
-                        ShowWindow(process.MainWindowHandle, SW_MINIMIZE);
+                        ShowWindow(process.MainWindowHandle, SW_SHOWNOACTIVATE);
 
                         try
                         {
