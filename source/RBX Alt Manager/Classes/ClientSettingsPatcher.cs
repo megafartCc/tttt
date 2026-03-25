@@ -1,34 +1,68 @@
-﻿using Microsoft.Win32;
+using Microsoft.Win32;
 using Newtonsoft.Json.Linq;
+using System;
 using System.IO;
 
 namespace RBX_Alt_Manager.Classes
 {
     public static class ClientSettingsPatcher
     {
+        private static DirectoryInfo ResolveRobloxVersionFolder()
+        {
+            string rawPath = Registry.ClassesRoot.OpenSubKey(@"roblox\DefaultIcon")?.GetValue("") as string;
+            if (string.IsNullOrWhiteSpace(rawPath))
+                return null;
+
+            string candidatePath = rawPath.Trim().Trim('"');
+            int iconSuffixIndex = candidatePath.IndexOf(',');
+            if (iconSuffixIndex > 1 && !File.Exists(candidatePath))
+                candidatePath = candidatePath.Substring(0, iconSuffixIndex);
+
+            candidatePath = candidatePath.Trim().Trim('"');
+
+            if (File.Exists(candidatePath))
+                return Directory.GetParent(candidatePath);
+
+            if (Directory.Exists(candidatePath))
+                return new DirectoryInfo(candidatePath);
+
+            return null;
+        }
+
         public static void PatchSettings()
         {
-            DirectoryInfo VersionFolder = null;
+            string CustomFN = AccountManager.General.Exists("CustomClientSettings") ? AccountManager.General.Get<string>("CustomClientSettings") : string.Empty;
+            bool HasCustomSettings = !string.IsNullOrEmpty(CustomFN) && File.Exists(CustomFN);
+            bool UnlockFps = AccountManager.General.Get<bool>("UnlockFPS");
 
-            object RegistryValue = Registry.ClassesRoot.OpenSubKey(@"roblox\DefaultIcon")?.GetValue("");
+            if (!HasCustomSettings && !UnlockFps)
+                return;
 
-            if (RegistryValue != null && RegistryValue is string RobloxPath)
-                VersionFolder = Directory.GetParent(RobloxPath);
+            DirectoryInfo VersionFolder = ResolveRobloxVersionFolder();
+            if (VersionFolder == null || !VersionFolder.Exists)
+                return;
 
-            if (VersionFolder == null || !VersionFolder.Exists) { Program.Logger.Error("Can't patch ClientAppSettings, folder doesn't exist"); return; }
-            if (!VersionFolder.Name.StartsWith("version-")) { Program.Logger.Error("Can't patch ClientAppSettings, folder doesn't start with 'version-'"); return; }
-            if (!File.Exists(Path.Combine(VersionFolder.FullName, "RobloxPlayerLauncher.exe"))) { Program.Logger.Error("Can't patch ClientAppSettings, RobloxPlayerBeta.exe not found"); return; }
+            if (!VersionFolder.Name.StartsWith("version-", StringComparison.OrdinalIgnoreCase))
+                return;
+
+            bool hasPlayerBinary =
+                File.Exists(Path.Combine(VersionFolder.FullName, "RobloxPlayerBeta.exe"))
+                || File.Exists(Path.Combine(VersionFolder.FullName, "RobloxPlayerLauncher.exe"));
+
+            if (!hasPlayerBinary)
+                return;
 
             DirectoryInfo SettingsFolder = new DirectoryInfo(Path.Combine(VersionFolder.FullName, "ClientSettings"));
+            if (!SettingsFolder.Exists)
+                SettingsFolder.Create();
 
-            if (!SettingsFolder.Exists) SettingsFolder.Create();
-
-            string CustomFN = AccountManager.General.Exists("CustomClientSettings") ? AccountManager.General.Get<string>("CustomClientSettings") : string.Empty;
             string SettingsFN = Path.Combine(SettingsFolder.FullName, "ClientAppSettings.json");
 
-            if (!string.IsNullOrEmpty(CustomFN) && File.Exists(CustomFN))
-                File.Copy(CustomFN, SettingsFN);
-            else if (AccountManager.General.Get<bool>("UnlockFPS"))
+            if (HasCustomSettings)
+            {
+                File.Copy(CustomFN, SettingsFN, true);
+            }
+            else if (UnlockFps)
             {
                 if (File.Exists(SettingsFN) && File.ReadAllText(SettingsFN).TryParseJson(out JObject Settings))
                 {
@@ -36,7 +70,10 @@ namespace RBX_Alt_Manager.Classes
                     File.WriteAllText(SettingsFN, Settings.ToString(Newtonsoft.Json.Formatting.None));
                 }
                 else
-                    File.WriteAllText(SettingsFN, "{\"DFIntTaskSchedulerTargetFps\":240}");
+                {
+                    int targetFps = AccountManager.General.Exists("MaxFPSValue") ? AccountManager.General.Get<int>("MaxFPSValue") : 240;
+                    File.WriteAllText(SettingsFN, $"{{\"DFIntTaskSchedulerTargetFps\":{targetFps}}}");
+                }
             }
         }
     }

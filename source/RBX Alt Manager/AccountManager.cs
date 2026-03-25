@@ -13,6 +13,7 @@ using Sodium;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
@@ -98,6 +99,11 @@ namespace RBX_Alt_Manager
         private System.Timers.Timer ProcessOptimizerTimer;
         private readonly static Regex BrowserTrackerRegex = new Regex(@"(?:\-b\s+|browsertrackerid[:=])(\d+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
         private readonly static Regex MultiRbxHandleRegex = new Regex(@"^\s*([0-9A-F]+):\s+\w+\s+.+\\(ROBLOX_singletonMutex|ROBLOX_singletonEvent)\b", RegexOptions.IgnoreCase | RegexOptions.Multiline | RegexOptions.Compiled);
+        private readonly static HashSet<string> MultiRbxCandidateProcessNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "RobloxPlayerBeta",
+            "RobloxPlayerLauncher"
+        };
         private int PresenceUpdateInProgress;
         private int LiveStatusUpdateInProgress;
         private int AutoRejoinUpdateInProgress;
@@ -1867,6 +1873,17 @@ namespace RBX_Alt_Manager
                 MarkAutoRejoinGrace(account, grace);
         }
 
+        private bool TryBeginManualLaunch(string contextTag)
+        {
+            if (Interlocked.CompareExchange(ref ManualLaunchGuardInProgress, 1, 0) == 1)
+            {
+                Program.Logger.Warn($"[{contextTag}] Ignored request because another manual launch is already in progress.");
+                return false;
+            }
+
+            return true;
+        }
+
         private void UpdateAutoRejoin()
         {
             if (!General.Get<bool>("AutoRejoin"))
@@ -2688,6 +2705,36 @@ namespace RBX_Alt_Manager
             return RobloxWatcher.IsHandleEulaAccepted();
         }
 
+        private static bool IsAccessDeniedException(Exception exception)
+        {
+            if (exception == null)
+                return false;
+
+            if (exception is Win32Exception win32 && win32.NativeErrorCode == 5)
+                return true;
+
+            return exception.Message?.IndexOf("Access is denied", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static bool TryGetProcessIdIfAlive(Process process, out int pid)
+        {
+            pid = -1;
+
+            if (process == null)
+                return false;
+
+            try
+            {
+                pid = process.Id;
+                return !process.HasExited;
+            }
+            catch
+            {
+                pid = -1;
+                return false;
+            }
+        }
+
         private IEnumerable<Process> GetMultiRobloxHandleCandidates()
         {
             List<Process> candidates = new List<Process>();
@@ -2699,7 +2746,7 @@ namespace RBX_Alt_Manager
                     try
                     {
                         string processName = process.ProcessName ?? string.Empty;
-                        if (processName.IndexOf("Roblox", StringComparison.OrdinalIgnoreCase) < 0)
+                        if (!MultiRbxCandidateProcessNames.Contains(processName))
                         {
                             process.Dispose();
                             continue;
@@ -2731,8 +2778,8 @@ namespace RBX_Alt_Manager
 
                 try
                 {
-                    pid = process.Id;
-                    if (process.HasExited) continue;
+                    if (!TryGetProcessIdIfAlive(process, out pid))
+                        continue;
 
                     ProcessStartInfo scan = new ProcessStartInfo(RobloxWatcher.HandlePath)
                     {
@@ -2754,6 +2801,9 @@ namespace RBX_Alt_Manager
                         }
 
                         string scanOutput = ReadProcessOutput(scanProc);
+                        if (scanProc.ExitCode != 0 && scanOutput.IndexOf("Access is denied", StringComparison.OrdinalIgnoreCase) >= 0)
+                            continue;
+
                         MatchCollection matches = MultiRbxHandleRegex.Matches(scanOutput ?? string.Empty);
 
                         foreach (Match match in matches)
@@ -2783,6 +2833,9 @@ namespace RBX_Alt_Manager
                                 }
 
                                 string closeOutput = ReadProcessOutput(closeProc);
+                                if (closeOutput.IndexOf("Access is denied", StringComparison.OrdinalIgnoreCase) >= 0)
+                                    continue;
+
                                 bool closed = closeProc.ExitCode == 0 && closeOutput.IndexOf("Error", StringComparison.OrdinalIgnoreCase) < 0;
 
                                 if (closed)
@@ -2796,6 +2849,9 @@ namespace RBX_Alt_Manager
                 }
                 catch (Exception x)
                 {
+                    if (IsAccessDeniedException(x))
+                        continue;
+
                     Program.Logger.Warn($"[MultiRbx] Failed singleton handle cleanup for PID {pid}: {x.Message}");
                 }
                 finally
@@ -3408,8 +3464,6 @@ namespace RBX_Alt_Manager
             if (!PlaceTimer.Enabled)
                 _ = Task.Run(() => AddRecentGame(new Game(PlaceId)));
 
-            CancelLaunching();
-
             List<Account> LaunchTargets = GetLaunchTargetsSnapshot();
             if (LaunchTargets.Count == 0)
             {
@@ -3417,45 +3471,57 @@ namespace RBX_Alt_Manager
                 return;
             }
 
-            Program.Logger.Info($"[BulkLaunch] JoinServer click selection resolved to {LaunchTargets.Count}: {string.Join(", ", LaunchTargets.Select(account => account?.Username ?? "unknown"))}");
+            if (!TryBeginManualLaunch("BulkLaunch"))
+                return;
 
-            bool LaunchMultiple = LaunchTargets.Count > 1;
-            Account SingleTarget = LaunchTargets.Count == 1 ? LaunchTargets[0] : null;
-            string JoinJobId = VIPServer ? JobID.Text.Substring(4) : JobID.Text;
-            PauseAutoRejoinFor(TimeSpan.FromSeconds(45), "manual join launch");
-            MarkAutoRejoinGrace(LaunchTargets, AutoRejoinOfflineThreshold);
-            Interlocked.Exchange(ref ManualLaunchGuardInProgress, 1);
-
-            _ = Task.Run(async () => // Run launch worker on thread-pool with hard exception guard to avoid process-killing async-void crashes.
+            try
             {
-                try
-                {
-                    if (LaunchMultiple)
-                    {
-                        if (!EnsureMultiRobloxForBulkLaunch())
-                            Program.Logger.Warn("[BulkLaunch] Multi Roblox prep failed in pre-check; continuing with best-effort launch.");
+                CancelLaunching();
 
-                        LauncherToken = new CancellationTokenSource();
-                        await LaunchAccounts(LaunchTargets, PlaceId, JoinJobId, false, VIPServer);
-                    }
-                    else if (SingleTarget != null)
-                    {
-                        string res = await JoinWithFailureRecovery(SingleTarget, PlaceId, JoinJobId, false, VIPServer, "JoinServer", allowGlobalReset: false);
+                Program.Logger.Info($"[BulkLaunch] JoinServer click selection resolved to {LaunchTargets.Count}: {string.Join(", ", LaunchTargets.Select(account => account?.Username ?? "unknown"))}");
 
-                        if (!IsJoinSuccess(res))
-                            this.InvokeIfRequired(() => MessageBox.Show(res));
+                bool LaunchMultiple = LaunchTargets.Count > 1;
+                Account SingleTarget = LaunchTargets.Count == 1 ? LaunchTargets[0] : null;
+                string JoinJobId = VIPServer ? JobID.Text.Substring(4) : JobID.Text;
+                PauseAutoRejoinFor(TimeSpan.FromSeconds(45), "manual join launch");
+                MarkAutoRejoinGrace(LaunchTargets, AutoRejoinOfflineThreshold);
+
+                _ = Task.Run(async () => // Run launch worker on thread-pool with hard exception guard to avoid process-killing async-void crashes.
+                {
+                    try
+                    {
+                        if (LaunchMultiple)
+                        {
+                            if (!EnsureMultiRobloxForBulkLaunch())
+                                Program.Logger.Warn("[BulkLaunch] Multi Roblox prep failed in pre-check; continuing with best-effort launch.");
+
+                            LauncherToken = new CancellationTokenSource();
+                            await LaunchAccounts(LaunchTargets, PlaceId, JoinJobId, false, VIPServer);
+                        }
+                        else if (SingleTarget != null)
+                        {
+                            string res = await JoinWithFailureRecovery(SingleTarget, PlaceId, JoinJobId, false, VIPServer, "JoinServer", allowGlobalReset: false);
+
+                            if (!IsJoinSuccess(res))
+                                this.InvokeIfRequired(() => MessageBox.Show(res));
+                        }
                     }
-                }
-                catch (Exception x)
-                {
-                    Program.Logger.Error($"[JoinServer] Unhandled launch worker error: {x}");
-                }
-                finally
-                {
-                    PauseAutoRejoinFor(TimeSpan.FromSeconds(20), "manual join launch settling");
-                    Interlocked.Exchange(ref ManualLaunchGuardInProgress, 0);
-                }
-            });
+                    catch (Exception x)
+                    {
+                        Program.Logger.Error($"[JoinServer] Unhandled launch worker error: {x}");
+                    }
+                    finally
+                    {
+                        PauseAutoRejoinFor(TimeSpan.FromSeconds(20), "manual join launch settling");
+                        Interlocked.Exchange(ref ManualLaunchGuardInProgress, 0);
+                    }
+                });
+            }
+            catch
+            {
+                Interlocked.Exchange(ref ManualLaunchGuardInProgress, 0);
+                throw;
+            }
         }
 
         private async void Follow_Click(object sender, EventArgs e)
@@ -3471,8 +3537,6 @@ namespace RBX_Alt_Manager
                 if (!(await Presence.GetPresenceSingular(UserId) is UserPresence Status && Status.userPresenceType == UserPresenceType.InGame && Status.placeId is long FollowPlaceID && FollowPlaceID > 0) &&
                     !Utilities.YesNoPrompt("Warning", "The user you are trying to follow is not in game or has their joins off", "Do you want to attempt to join anyways?")) return;
 
-                CancelLaunching();
-
                 List<Account> LaunchTargets = GetLaunchTargetsSnapshot();
                 if (LaunchTargets.Count == 0)
                 {
@@ -3480,14 +3544,18 @@ namespace RBX_Alt_Manager
                     return;
                 }
 
-                bool LaunchMultiple = LaunchTargets.Count > 1;
-                Account SingleTarget = LaunchTargets.Count == 1 ? LaunchTargets[0] : null;
-                PauseAutoRejoinFor(TimeSpan.FromSeconds(45), "manual follow launch");
-                MarkAutoRejoinGrace(LaunchTargets, AutoRejoinOfflineThreshold);
-                Interlocked.Exchange(ref ManualLaunchGuardInProgress, 1);
+                if (!TryBeginManualLaunch("FollowLaunch"))
+                    return;
 
                 try
                 {
+                    CancelLaunching();
+
+                    bool LaunchMultiple = LaunchTargets.Count > 1;
+                    Account SingleTarget = LaunchTargets.Count == 1 ? LaunchTargets[0] : null;
+                    PauseAutoRejoinFor(TimeSpan.FromSeconds(45), "manual follow launch");
+                    MarkAutoRejoinGrace(LaunchTargets, AutoRejoinOfflineThreshold);
+
                     if (LaunchMultiple)
                     {
                         LauncherToken = new CancellationTokenSource();
