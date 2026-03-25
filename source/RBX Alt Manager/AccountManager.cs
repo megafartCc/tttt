@@ -192,9 +192,6 @@ namespace RBX_Alt_Manager
         private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, int[] attrValue, int attrSize);
         [DllImport("ntdll.dll")]
         private static extern int NtSetInformationProcess(IntPtr processHandle, int processInformationClass, ref int processInformation, int processInformationLength);
-        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern bool SetWindowText(IntPtr hWnd, string lpString);
-
         private const int ProcessIoPriorityClass = 33;
 
         public static void SetDarkBar(IntPtr Handle)
@@ -2996,7 +2993,7 @@ namespace RBX_Alt_Manager
             return 0;
         }
 
-        private async Task<bool> WaitForLaunchEvidence(Account account, int previousProcessId, int baselineProcessCount, int timeoutMs = 12000)
+        private async Task<bool> WaitForLaunchEvidence(Account account, int previousProcessId, int baselineProcessCount, int timeoutMs = 12000, bool allowProcessCountFallback = true)
         {
             string trackerId = account?.BrowserTrackerID;
             Stopwatch timer = Stopwatch.StartNew();
@@ -3014,7 +3011,7 @@ namespace RBX_Alt_Manager
                         return true;
                 }
 
-                if (GetRobloxPlayerProcessCount() > baselineProcessCount)
+                if (allowProcessCountFallback && GetRobloxPlayerProcessCount() > baselineProcessCount)
                     return true;
 
                 await Task.Delay(200);
@@ -3175,7 +3172,7 @@ namespace RBX_Alt_Manager
                 AccountsView.InvokeIfRequired(() => AccountsView.RefreshObjects(Updates));
         }
 
-        private async Task<string> JoinWithFailureRecovery(Account account, long placeId, string jobId, bool followUser, bool vipServer, string contextTag, bool allowGlobalReset = true, bool requireNewProcess = false)
+        private async Task<string> JoinWithFailureRecovery(Account account, long placeId, string jobId, bool followUser, bool vipServer, string contextTag, bool allowGlobalReset = true, bool requireNewProcess = false, int launchEvidenceTimeoutMs = 12000, bool allowProcessCountFallback = true)
         {
             if (account == null)
                 return "ERROR: Account is null";
@@ -3186,7 +3183,7 @@ namespace RBX_Alt_Manager
             string result = await account.JoinServer(placeId, jobId, followUser, vipServer);
             if (IsJoinSuccess(result) && requireNewProcess)
             {
-                bool launched = await WaitForLaunchEvidence(account, previousProcessId, baselineProcessCount);
+                bool launched = await WaitForLaunchEvidence(account, previousProcessId, baselineProcessCount, launchEvidenceTimeoutMs, allowProcessCountFallback);
                 if (!launched)
                 {
                     Program.Logger.Warn($"[{contextTag}] Join call for {account.Username} returned but no new process was detected.");
@@ -3212,7 +3209,7 @@ namespace RBX_Alt_Manager
 
                 if (IsJoinSuccess(retryNoReset) && requireNewProcess)
                 {
-                    bool launched = await WaitForLaunchEvidence(account, retryPreviousPid, retryBaselineCount);
+                    bool launched = await WaitForLaunchEvidence(account, retryPreviousPid, retryBaselineCount, launchEvidenceTimeoutMs, allowProcessCountFallback);
                     if (!launched)
                     {
                         Program.Logger.Warn($"[{contextTag}] Retry join for {account.Username} returned but still no new process was detected.");
@@ -3241,7 +3238,7 @@ namespace RBX_Alt_Manager
 
             if (IsJoinSuccess(retryResult) && requireNewProcess)
             {
-                bool launched = await WaitForLaunchEvidence(account, retryProcessId, retryProcessCount);
+                bool launched = await WaitForLaunchEvidence(account, retryProcessId, retryProcessCount, launchEvidenceTimeoutMs, allowProcessCountFallback);
                 if (!launched)
                 {
                     Program.Logger.Warn($"[{contextTag}] Retry join for {account.Username} returned but no new process was detected.");
@@ -4164,7 +4161,9 @@ namespace RBX_Alt_Manager
                                     VIPServer,
                                     "BulkLaunch",
                                     allowGlobalReset: false,
-                                    requireNewProcess: false);
+                                    requireNewProcess: true,
+                                    launchEvidenceTimeoutMs: 18000,
+                                    allowProcessCountFallback: false);
 
                                 if (!IsJoinSuccess(Result))
                                 {
@@ -4500,24 +4499,6 @@ namespace RBX_Alt_Manager
                 catch { }
             }
 
-            try
-            {
-                if (process.MainWindowHandle != IntPtr.Zero)
-                {
-                    string title = null;
-                    List<Account> snapshot = AccountsList?.ToList();
-                    if (snapshot != null)
-                    {
-                        Account matched = snapshot.FirstOrDefault(account => account != null && account.CurrentProcessId == process.Id && !string.IsNullOrWhiteSpace(account.Username));
-                        if (matched != null)
-                            title = matched.Username;
-                    }
-
-                    if (!string.IsNullOrWhiteSpace(title))
-                        SetWindowText(process.MainWindowHandle, title);
-                }
-            }
-            catch { }
         }
 
         private void TryApplyProcessOptimization()

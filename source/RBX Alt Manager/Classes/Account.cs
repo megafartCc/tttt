@@ -61,8 +61,6 @@ namespace RBX_Alt_Manager
         static extern IntPtr SetWindowLongPtr64(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
         [DllImport("user32.dll", SetLastError = true)]
         static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
-        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        static extern bool SetWindowText(IntPtr hWnd, string lpString);
         [DllImport("psapi.dll", SetLastError = true)]
         static extern bool EmptyWorkingSet(IntPtr hProcess);
 
@@ -293,6 +291,23 @@ namespace RBX_Alt_Manager
             catch { }
 
             return 0;
+        }
+
+        private bool HasFreshPlaceJoinSignal(long expectedPlaceId)
+        {
+            if (expectedPlaceId <= 0)
+                return true;
+
+            if (!CurrentPlaceId.HasValue || CurrentPlaceId.Value != expectedPlaceId)
+                return false;
+
+            if (LastAppLaunch == DateTime.MinValue)
+                return true;
+
+            if (LastLiveStatusUpdateUtc == DateTime.MinValue)
+                return false;
+
+            return LastLiveStatusUpdateUtc >= LastAppLaunch.AddSeconds(-1);
         }
 
         private static int GetSecureRandomNumber(int minInclusive, int maxExclusive)
@@ -935,7 +950,7 @@ namespace RBX_Alt_Manager
                             Roblox.Arguments = string.Format("--app -t {0} -j \"https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestGame{3}&placeId={1}{2}&isPlayTogetherGame=false\"", Ticket, PlaceID, "&gameId=" + JobID, string.IsNullOrEmpty(JobID) ? "" : "Job");
                     });
 
-                    _ = Task.Run(() => AdjustWindowPosition(ignoredProcessId, LastTinyLaunchSlot));
+                    _ = Task.Run(() => AdjustWindowPosition(ignoredProcessId, LastTinyLaunchSlot, PlaceID));
 
                     return "Success";
                 }
@@ -970,7 +985,7 @@ namespace RBX_Alt_Manager
                             if (!Internal)
                                 AccountManager.Instance.NextAccount();
 
-                            _ = Task.Run(() => AdjustWindowPosition(ignoredProcessId, LastTinyLaunchSlot));
+                            _ = Task.Run(() => AdjustWindowPosition(ignoredProcessId, LastTinyLaunchSlot, PlaceID));
                         }
                         catch (Exception x)
                         {
@@ -989,7 +1004,7 @@ namespace RBX_Alt_Manager
                 return "ERROR: Invalid Authentication Ticket, re-add the account or try again\n(Failed to get Authentication Ticket, Roblox has probably signed you out)";
         }
 
-        public async void AdjustWindowPosition(int ignoredProcessId = 0, int preferredSlot = -1)
+        public async void AdjustWindowPosition(int ignoredProcessId = 0, int preferredSlot = -1, long expectedPlaceId = 0)
         {
             int slot = -1;
             bool slotReleased = false;
@@ -1072,6 +1087,9 @@ namespace RBX_Alt_Manager
                             if (!trackerMatched && !allowSingleFallback)
                                 continue;
 
+                            if (!HasFreshPlaceJoinSignal(expectedPlaceId))
+                                continue;
+
                             Found = true;
                             LastTinyLaunchSlot = slot;
 
@@ -1115,13 +1133,6 @@ namespace RBX_Alt_Manager
                                 ReleaseTinyLaunchSlot(slot);
                                 slotReleased = true;
                             }
-
-                            try
-                            {
-                                if (!string.IsNullOrWhiteSpace(Username))
-                                    SetWindowText(mainWindowHandle, Username);
-                            }
-                            catch { }
 
                             try
                             {
