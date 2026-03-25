@@ -4124,7 +4124,7 @@ namespace RBX_Alt_Manager
             if (MultiLaunch)
             {
                 AsyncJoin = false; // Always run selected multi-launch as strict queue.
-                InterLaunchDelayMs = 300; // Ultra-fast queue for multiselect launch.
+                InterLaunchDelayMs = LaunchQueue.Count >= 10 ? 450 : 300; // Avoid overwhelming the host on very large multiselect launches.
             }
 
             Program.Logger.Info($"[BulkLaunch] Queue size {LaunchQueue.Count}: {string.Join(", ", LaunchQueue.Select(account => account?.Username ?? "unknown"))}");
@@ -4142,59 +4142,69 @@ namespace RBX_Alt_Manager
 
                     object failureLock = new object();
                     List<Task> launchTasks = new List<Task>();
-
-                    for (int i = 0; i < total; i++)
+                    int maxParallelLaunches = Math.Max(2, Math.Min(4, Math.Max(1, Environment.ProcessorCount / 4)));
+                    using (SemaphoreSlim launchGate = new SemaphoreSlim(maxParallelLaunches, maxParallelLaunches))
                     {
-                        Account account = LaunchQueue[i];
-                        int launchIndex = i + 1;
+                        Program.Logger.Info($"[BulkLaunch] Concurrency cap {maxParallelLaunches}, stagger {InterLaunchDelayMs}ms.");
 
-                        if (Token != null && Token.IsCancellationRequested)
-                            break;
-
-                        Program.Logger.Info($"[BulkLaunch] Launching {launchIndex}/{total}: {account?.Username ?? "unknown"}");
-
-                        launchTasks.Add(Task.Run(async () =>
+                        for (int i = 0; i < total; i++)
                         {
-                            try
-                            {
-                                string Result = await JoinWithFailureRecovery(
-                                    account,
-                                    PlaceID,
-                                    JobID,
-                                    FollowUser,
-                                    VIPServer,
-                                    "BulkLaunch",
-                                    allowGlobalReset: false,
-                                    requireNewProcess: true,
-                                    launchEvidenceTimeoutMs: 18000,
-                                    allowProcessCountFallback: false);
+                            Account account = LaunchQueue[i];
+                            int launchIndex = i + 1;
 
-                                if (!IsJoinSuccess(Result))
+                            if (Token != null && Token.IsCancellationRequested)
+                                break;
+
+                            await launchGate.WaitAsync();
+                            Program.Logger.Info($"[BulkLaunch] Launching {launchIndex}/{total}: {account?.Username ?? "unknown"}");
+
+                            launchTasks.Add(Task.Run(async () =>
+                            {
+                                try
                                 {
-                                    Program.Logger.Warn($"[BulkLaunch] Failed launching {account.Username}: {Result}");
+                                    string Result = await JoinWithFailureRecovery(
+                                        account,
+                                        PlaceID,
+                                        JobID,
+                                        FollowUser,
+                                        VIPServer,
+                                        "BulkLaunch",
+                                        allowGlobalReset: false,
+                                        requireNewProcess: true,
+                                        launchEvidenceTimeoutMs: 18000,
+                                        allowProcessCountFallback: false);
+
+                                    if (!IsJoinSuccess(Result))
+                                    {
+                                        Program.Logger.Warn($"[BulkLaunch] Failed launching {account.Username}: {Result}");
+                                        lock (failureLock)
+                                            Failures.Add($"{account.Username}: {Result.Split('\n').FirstOrDefault() ?? Result}");
+                                    }
+                                    else
+                                    {
+                                        MarkAutoRejoinGrace(account, AutoRejoinOfflineThreshold);
+                                        int trackerPid = FindRobloxProcessIdByTracker(account.BrowserTrackerID);
+                                        Program.Logger.Info($"[BulkLaunch] Success launching {launchIndex}/{total}: {account.Username} | pid={trackerPid} | totalRoblox={GetRobloxPlayerProcessCount()}");
+                                    }
+                                }
+                                catch (Exception x)
+                                {
+                                    Program.Logger.Error($"[BulkLaunch] Exception launching {account?.Username ?? "unknown"}: {x}");
                                     lock (failureLock)
-                                        Failures.Add($"{account.Username}: {Result.Split('\n').FirstOrDefault() ?? Result}");
+                                        Failures.Add($"{account?.Username ?? "unknown"}: {x.Message}");
                                 }
-                                else
+                                finally
                                 {
-                                    MarkAutoRejoinGrace(account, AutoRejoinOfflineThreshold);
-                                    int trackerPid = FindRobloxProcessIdByTracker(account.BrowserTrackerID);
-                                    Program.Logger.Info($"[BulkLaunch] Success launching {launchIndex}/{total}: {account.Username} | pid={trackerPid} | totalRoblox={GetRobloxPlayerProcessCount()}");
+                                    launchGate.Release();
                                 }
-                            }
-                            catch (Exception x)
-                            {
-                                Program.Logger.Error($"[BulkLaunch] Exception launching {account?.Username ?? "unknown"}: {x}");
-                                lock (failureLock)
-                                    Failures.Add($"{account?.Username ?? "unknown"}: {x.Message}");
-                            }
-                        }));
+                            }));
 
-                        if (InterLaunchDelayMs > 0)
-                            await Task.Delay(InterLaunchDelayMs);
+                            if (InterLaunchDelayMs > 0)
+                                await Task.Delay(InterLaunchDelayMs);
+                        }
+
+                        await Task.WhenAll(launchTasks);
                     }
-
-                    await Task.WhenAll(launchTasks);
                 }
                 else
                 {
