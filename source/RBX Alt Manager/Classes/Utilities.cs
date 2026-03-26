@@ -68,6 +68,23 @@ public static class Utilities
             _Action();
     }
 
+    public static void Forget(this Task task, string context)
+    {
+        if (task == null)
+            return;
+
+        task.ContinueWith(t =>
+        {
+            try
+            {
+                Exception ex = t.Exception?.Flatten();
+                if (ex != null)
+                    Program.Logger.Error($"[Task] {context}: {ex}");
+            }
+            catch { }
+        }, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+    }
+
     public static string MD5(string input)
     {
         MD5 md5 = System.Security.Cryptography.MD5.Create();

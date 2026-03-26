@@ -40,7 +40,7 @@ namespace RBX_Alt_Manager.Classes
 
         public AccountBrowser(Account account, string Url = null, string Script = null, Func<Page, Task> PostNavigation = null)
         {
-            _ = LaunchBrowser(Url ?? string.Empty, Script: Script, PostNavigation: PostNavigation, PostPageCreation: () => page.SetCookieAsync(new CookieParam
+            LaunchBrowser(Url ?? string.Empty, Script: Script, PostNavigation: PostNavigation, PostPageCreation: () => page.SetCookieAsync(new CookieParam
             {
                 Name = ".ROBLOSECURITY",
                 Domain = ".roblox.com",
@@ -49,7 +49,7 @@ namespace RBX_Alt_Manager.Classes
                 Secure = true,
                 Url = "https://roblox.com",
                 Value = account.SecurityToken
-            }));
+            })).Forget("AccountBrowser.LaunchBrowser(account)");
         }
 
         public async Task LaunchBrowser(string Url = "https://roblox.com/", Func<Task> PostPageCreation = null, Func<Page, Task> PostNavigation = null, string Script = null, string[] Arguments = null)
@@ -197,115 +197,143 @@ namespace RBX_Alt_Manager.Classes
             catch (Exception ex) { Program.Logger.Error($"An exception was caught while trying to automatically log in: {ex}"); }
         }
 
+        private static bool IsRedirectResponseException(Exception ex)
+        {
+            while (ex != null)
+            {
+                if (ex is PuppeteerException && ex.Message?.IndexOf("Response body is unavailable for redirect responses", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
+
+                ex = ex.InnerException;
+            }
+
+            return false;
+        }
+
         private async void Page_FrameAttached(object sender, FrameEventArgs e)
         {
-            if (!AccountManager.General.Exists("NopechaKey")) return;
-
-            string APIKey = AccountManager.General.Get<string>("NopechaKey");
-
-            var Start = DateTime.Now;
-
-            while (string.IsNullOrEmpty(e.Frame.Name) && (DateTime.Now - Start).TotalSeconds < 10)
-                await Task.Delay(200);
-
-            if ((DateTime.Now - Start).TotalSeconds > 3) return;
-
-            if (e.Frame.Name == "CaptchaFrame" || e.Frame.Name == "CaptchaFrame2" || e.Frame.Name == "game-core-frame")
+            try
             {
-                using HttpClient client = new HttpClient();
-                try // :|
+                if (!AccountManager.General.Exists("NopechaKey")) return;
+
+                string APIKey = AccountManager.General.Get<string>("NopechaKey");
+
+                var Start = DateTime.Now;
+
+                while (string.IsNullOrEmpty(e.Frame.Name) && (DateTime.Now - Start).TotalSeconds < 10)
+                    await Task.Delay(200);
+
+                if ((DateTime.Now - Start).TotalSeconds > 3) return;
+
+                if (e.Frame.Name == "CaptchaFrame" || e.Frame.Name == "CaptchaFrame2" || e.Frame.Name == "game-core-frame")
                 {
-                    while (browser.IsConnected && !page.IsClosed && !e.Frame.Detached)
+                    using HttpClient client = new HttpClient();
+                    try // :|
                     {
-                        await Task.Delay(500);
-
-                        if (e.Frame.QuerySelectorAsync("#app") == null && e.Frame.QuerySelectorAsync("#root") == null) continue;
-
-                        try // :|
+                        while (browser.IsConnected && !page.IsClosed && !e.Frame.Detached)
                         {
-                            var VerifyButton = await e.Frame.QuerySelectorAsync("#home_children_button");
-                            var RetryButton = await e.Frame.QuerySelectorAsync("#wrong_children_button");
+                            await Task.Delay(500);
 
-                            if (VerifyButton == null && await e.Frame.XPathAsync("//*[@id=\"root\"]/div/div[1]/button") is IElementHandle[] VB && VB.Length > 0) VerifyButton = VB[0];
+                            if (e.Frame.QuerySelectorAsync("#app") == null && e.Frame.QuerySelectorAsync("#root") == null) continue;
 
-                            if (VerifyButton != null) await VerifyButton.ClickAsync();
-                            else if (RetryButton != null) await RetryButton.ClickAsync();
-
-                            var CaptchaImage = await e.Frame.QuerySelectorAsync("#game_challengeItem_image");
-                            var TaskElement = await e.Frame.XPathAsync("//*[@id=\"game_children_text\"]/h2");
-
-                            if (CaptchaImage == null && await e.Frame.XPathAsync("//*[@id=\"root\"]/div/div[1]/div/div[3]/div/button[1]") is IElementHandle[] CI && CI.Length > 0) CaptchaImage = CI[0];
-                            if (TaskElement.Length < 1) TaskElement = await e.Frame.XPathAsync("//*[@id=\"root\"]/div/div[1]/div/div[1]/h2");
-
-                            if (TaskElement.Length < 1) continue;
-
-                            string TaskString = await e.Frame.EvaluateFunctionAsync<string>("e => e.textContent", TaskElement[0]);
-
-                            if (!string.IsNullOrEmpty(TaskString) && CaptchaImage != null)
+                            try // :|
                             {
-                                string Source = await e.Frame.EvaluateFunctionAsync<string>("e => e.src", CaptchaImage);
+                                var VerifyButton = await e.Frame.QuerySelectorAsync("#home_children_button");
+                                var RetryButton = await e.Frame.QuerySelectorAsync("#wrong_children_button");
 
-                                if (string.IsNullOrEmpty(Source) && await e.Frame.EvaluateFunctionAsync<bool>("e => e instanceof HTMLButtonElement", CaptchaImage))
-                                    Source = await e.Frame.EvaluateFunctionAsync<string>("x => new Promise(a=>fetch(x.style.backgroundImage.match(/(?!^)\".*?\"/g)[0].replaceAll('\"', '')).then(e=>e.blob()).then(e=>{const t=new FileReader;t.onload=()=>a(t.result),t.readAsDataURL(e)}))", CaptchaImage);
+                                if (VerifyButton == null && await e.Frame.XPathAsync("//*[@id=\"root\"]/div/div[1]/button") is IElementHandle[] VB && VB.Length > 0) VerifyButton = VB[0];
 
-                                if (string.IsNullOrEmpty(Source)) continue;
+                                if (VerifyButton != null) await VerifyButton.ClickAsync();
+                                else if (RetryButton != null) await RetryButton.ClickAsync();
 
-                                if (Images.ContainsKey(Source) && !Solved.Contains(Source))
+                                var CaptchaImage = await e.Frame.QuerySelectorAsync("#game_challengeItem_image");
+                                var TaskElement = await e.Frame.XPathAsync("//*[@id=\"game_children_text\"]/h2");
+
+                                if (CaptchaImage == null && await e.Frame.XPathAsync("//*[@id=\"root\"]/div/div[1]/div/div[3]/div/button[1]") is IElementHandle[] CI && CI.Length > 0) CaptchaImage = CI[0];
+                                if (TaskElement.Length < 1) TaskElement = await e.Frame.XPathAsync("//*[@id=\"root\"]/div/div[1]/div/div[1]/h2");
+
+                                if (TaskElement.Length < 1) continue;
+
+                                string TaskString = await e.Frame.EvaluateFunctionAsync<string>("e => e.textContent", TaskElement[0]);
+
+                                if (!string.IsNullOrEmpty(TaskString) && CaptchaImage != null)
                                 {
-                                    var Response = await client.GetAsync($"https://api.nopecha.com/?key={APIKey}&id={Images[Source]}");
+                                    string Source = await e.Frame.EvaluateFunctionAsync<string>("e => e.src", CaptchaImage);
 
-                                    JObject Data = JObject.Parse(await Response.Content.ReadAsStringAsync());
+                                    if (string.IsNullOrEmpty(Source) && await e.Frame.EvaluateFunctionAsync<bool>("e => e instanceof HTMLButtonElement", CaptchaImage))
+                                        Source = await e.Frame.EvaluateFunctionAsync<string>("x => new Promise(a=>fetch(x.style.backgroundImage.match(/(?!^)\".*?\"/g)[0].replaceAll('\"', '')).then(e=>e.blob()).then(e=>{const t=new FileReader;t.onload=()=>a(t.result),t.readAsDataURL(e)}))", CaptchaImage);
 
-                                    if (Data.ContainsKey("data") && !Data.ContainsKey("error"))
+                                    if (string.IsNullOrEmpty(Source)) continue;
+
+                                    if (Images.ContainsKey(Source) && !Solved.Contains(Source))
                                     {
-                                        int CorrectIndex = Array.IndexOf(Data["data"].ToObject<bool[]>(), true);
-                                        var Correct = await e.Frame.XPathAsync($"//*[@id=\"image{CorrectIndex + 1}\"]/a");
+                                        var Response = await client.GetAsync($"https://api.nopecha.com/?key={APIKey}&id={Images[Source]}");
 
-                                        if (Correct.Length < 1)
-                                            Correct = await e.Frame.XPathAsync($"//*[@id=\"root\"]/div/div[1]/div/div[3]/div/button[{CorrectIndex + 1}]");
+                                        JObject Data = JObject.Parse(await Response.Content.ReadAsStringAsync());
 
-                                        if (Correct != null && Correct.Length > 0)
+                                        if (Data.ContainsKey("data") && !Data.ContainsKey("error"))
                                         {
-                                            try { await e.Frame.EvaluateExpressionAsync($"var x=document.evaluate('//*[@id=\"image{CorrectIndex + 1}\"]/a', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;x.style.backgroundColor='#00ff00';x.style.opacity='24%'"); } catch { }
-                                            try { await e.Frame.EvaluateExpressionAsync($"var x=document.evaluate('//*[@id=\"root\"]/div/div[1]/div/div[3]/div/button[{CorrectIndex + 1}]', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;x.style.opacity='60%';setTimeout(()=>{{temp1.style.opacity = '100%';}},3000);"); } catch { }
+                                            int CorrectIndex = Array.IndexOf(Data["data"].ToObject<bool[]>(), true);
+                                            var Correct = await e.Frame.XPathAsync($"//*[@id=\"image{CorrectIndex + 1}\"]/a");
 
-                                            if (AccountManager.General.Get<bool>("NopechaAutoSolve")) await Correct[0].ClickAsync();
+                                            if (Correct.Length < 1)
+                                                Correct = await e.Frame.XPathAsync($"//*[@id=\"root\"]/div/div[1]/div/div[3]/div/button[{CorrectIndex + 1}]");
 
-                                            Solved.Add(Source);
+                                            if (Correct != null && Correct.Length > 0)
+                                            {
+                                                try { await e.Frame.EvaluateExpressionAsync($"var x=document.evaluate('//*[@id=\"image{CorrectIndex + 1}\"]/a', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;x.style.backgroundColor='#00ff00';x.style.opacity='24%'"); } catch { }
+                                                try { await e.Frame.EvaluateExpressionAsync($"var x=document.evaluate('//*[@id=\"root\"]/div/div[1]/div/div[3]/div/button[{CorrectIndex + 1}]', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;x.style.opacity='60%';setTimeout(()=>{{temp1.style.opacity = '100%';}},3000);"); } catch { }
+
+                                                if (AccountManager.General.Get<bool>("NopechaAutoSolve")) await Correct[0].ClickAsync();
+
+                                                Solved.Add(Source);
+                                            }
+
+                                            await Task.Delay(1800);
                                         }
-
-                                        await Task.Delay(1800);
                                     }
-                                }
-                                else
-                                {
-                                    var Response = await client.PostAsync("https://api.nopecha.com/", JsonContent.Create(new { key = APIKey, type = "funcaptcha", task = TaskString, image_data = new string[] { Source.Substring(23) } }));
-                                    Response.EnsureSuccessStatusCode();
-
-                                    JObject data = JObject.Parse(await Response.Content.ReadAsStringAsync());
-
-                                    if (!data.ContainsKey("error") && data.ContainsKey("data"))
+                                    else
                                     {
-                                        Images.Add(Source, data?["data"]?.Value<string>() ?? "");
+                                        var Response = await client.PostAsync("https://api.nopecha.com/", JsonContent.Create(new { key = APIKey, type = "funcaptcha", task = TaskString, image_data = new string[] { Source.Substring(23) } }));
+                                        Response.EnsureSuccessStatusCode();
 
-                                        await Task.Delay(500);
+                                        JObject data = JObject.Parse(await Response.Content.ReadAsStringAsync());
+
+                                        if (!data.ContainsKey("error") && data.ContainsKey("data"))
+                                        {
+                                            Images.Add(Source, data?["data"]?.Value<string>() ?? "");
+
+                                            await Task.Delay(500);
+                                        }
                                     }
                                 }
                             }
+                            catch { }
                         }
-                        catch { }
                     }
+                    catch { } // Ignore exceptions
                 }
-                catch { } // Ignore exceptions
+            }
+            catch (Exception x)
+            {
+                Program.Logger.Warn($"[AccountBrowser] Page_FrameAttached failed: {x.Message}");
             }
         }
 
         private async void Page_RequestFinished(object sender, RequestEventArgs e)
         {
-            Uri Url = new Uri(e.Request.Url);
-
-            if (e.Request.Response.Status == HttpStatusCode.OK && e.Request.Method == HttpMethod.Post && Url.Host == "auth.roblox.com")
+            try
             {
+                if (e?.Request == null || string.IsNullOrWhiteSpace(e.Request.Url))
+                    return;
+
+                Uri Url = new Uri(e.Request.Url);
+                if (e.Request.Method != HttpMethod.Post || !string.Equals(Url.Host, "auth.roblox.com", StringComparison.OrdinalIgnoreCase))
+                    return;
+
+                if (e.Request.Response == null || e.Request.Response.Status != HttpStatusCode.OK)
+                    return;
+
                 if ((Url.AbsolutePath == "/v2/login" || Url.AbsolutePath == "/v2/signup") && e.Request.PostData != null && Utilities.TryParseJson((string)e.Request.PostData, out JObject LoginData))
                 {
                     if (LoginData?["password"]?.Value<string>() is string password && !string.IsNullOrEmpty(password) && LoginData?["ctype"].Value<string>() is string loginType && loginType.ToLowerInvariant() == "username")
@@ -316,6 +344,14 @@ namespace RBX_Alt_Manager.Classes
                 }
                 else if (Regex.IsMatch(Url.AbsolutePath, "/users/[0-9]+/two-step-verification/login") && (await page.GetCookiesAsync("https://roblox.com/")).FirstOrDefault(Cookie => Cookie.Name == ".ROBLOSECURITY") is CookieParam Cookie)
                     await AddAccount(Cookie);
+            }
+            catch (PuppeteerException x) when (IsRedirectResponseException(x))
+            {
+                Program.Logger.Warn("[AccountBrowser] Ignoring redirect response while handling RequestFinished.");
+            }
+            catch (Exception x)
+            {
+                Program.Logger.Warn($"[AccountBrowser] Page_RequestFinished failed: {x.Message}");
             }
         }
 

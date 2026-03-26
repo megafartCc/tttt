@@ -3951,7 +3951,7 @@ namespace RBX_Alt_Manager
                 for (int i = 0; i < Math.Min(Count, 15); i++) {
                     var Browser = new AccountBrowser() { Size = Size, Index = i };
 
-                    _ = Browser.LaunchBrowser(Url: Link.ToString(), Script: Script, PostNavigation: async (p) => await Browser.LoginTask(p));
+                    Browser.LaunchBrowser(Url: Link.ToString(), Script: Script, PostNavigation: async (p) => await Browser.LoginTask(p)).Forget("AccountManager.customURLJSToolStripMenuItem.LaunchBrowser");
                 }
             }
         }
