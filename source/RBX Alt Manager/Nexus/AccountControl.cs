@@ -320,7 +320,7 @@ namespace RBX_Alt_Manager.Forms
             AutoCloseCB.Checked = AccountManager.AccountControl.Get<bool>("AutoCloseEnabled");
             InternetCheckCB.Checked = AccountManager.AccountControl.Get<bool>("InternetCheck");
             UsePresenceCB.Checked = AccountManager.AccountControl.Get<bool>("UsePresence");
-            AutoMinIntervalNum.Value = Math.Max(Math.Min(AccountManager.AccountControl.Get<decimal>("AutoMinimizeInterval"), AutoMinIntervalNum.Minimum), AutoMinIntervalNum.Maximum);
+            AutoMinIntervalNum.Value = Math.Max(Math.Min(AccountManager.AccountControl.Get<decimal>("AutoMinimizeInterval"), AutoMinIntervalNum.Maximum), AutoMinIntervalNum.Minimum);
             AutoCloseIntervalNum.Value = Math.Max(Math.Min(AccountManager.AccountControl.Get<decimal>("AutoCloseInterval"), AutoCloseIntervalNum.Maximum), AutoCloseIntervalNum.Minimum);
             MaxInstancesNum.Value = Math.Max(Math.Min(AccountManager.AccountControl.Get<int>("MaxInstances"), MaxInstancesNum.Maximum), MaxInstancesNum.Minimum);
             AutoCloseType.SelectedIndex = AccountManager.AccountControl.Get<int>("AutoCloseType");

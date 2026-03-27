@@ -856,6 +856,48 @@ namespace RBX_Alt_Manager
             return false;
         }
 
+        private string BuildLaunchRequestUrl(long placeId, string jobId, bool followUser, bool joinVIP, string accessCode, string linkCode)
+        {
+            if (joinVIP)
+                return $"https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestPrivateGame&placeId={placeId}&accessCode={accessCode}&linkCode={linkCode}";
+
+            if (followUser)
+                return $"https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestFollowUser&userId={placeId}";
+
+            return $"https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestGame{(string.IsNullOrEmpty(jobId) ? "" : "Job")}&browserTrackerId={BrowserTrackerID}&placeId={placeId}{(string.IsNullOrEmpty(jobId) ? "" : ("&gameId=" + jobId))}&isPlayTogetherGame=false{(AccountManager.IsTeleport ? "&isTeleport=true" : "")}";
+        }
+
+        private static string ResolveRobloxPlayerPath()
+        {
+            string versionPath = Path.Combine(@"C:\Program Files (x86)\Roblox\Versions", AccountManager.CurrentVersion ?? string.Empty);
+            if (!Directory.Exists(versionPath))
+                versionPath = Path.Combine(Environment.GetEnvironmentVariable("LocalAppData") ?? string.Empty, @"Roblox\Versions", AccountManager.CurrentVersion ?? string.Empty);
+
+            if (!Directory.Exists(versionPath))
+                return string.Empty;
+
+            string executablePath = Path.Combine(versionPath, "RobloxPlayerBeta.exe");
+            return File.Exists(executablePath) ? executablePath : string.Empty;
+        }
+
+        private static void LaunchRobloxPlayerExecutable(string executablePath, string ticket, string launchRequestUrl)
+        {
+            if (string.IsNullOrWhiteSpace(executablePath))
+                throw new FileNotFoundException("Failed to find ROBLOX executable.");
+
+            ProcessStartInfo roblox = new ProcessStartInfo(executablePath)
+            {
+                UseShellExecute = false,
+                Arguments = $"--app -t {ticket} -j \"{launchRequestUrl}\""
+            };
+
+            Process launchedProcess = Process.Start(roblox);
+            if (launchedProcess == null)
+                throw new InvalidOperationException("RobloxPlayerBeta.exe failed to start.");
+
+            try { launchedProcess.Dispose(); } catch { }
+        }
+
         public async Task<string> JoinServer(long PlaceID, string JobID = "", bool FollowUser = false, bool JoinVIP = false, bool Internal = false) // oh god i am not refactoring everything to be async im sorry
         {
             if (string.IsNullOrEmpty(BrowserTrackerID))
@@ -974,34 +1016,20 @@ namespace RBX_Alt_Manager
 
                 double LaunchTime = Math.Floor((DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalSeconds * 1000);
 
+                string launchRequestUrl = BuildLaunchRequestUrl(PlaceID, JobID, FollowUser, JoinVIP, AccessCode, LinkCode);
+
                 if (AccountManager.UseOldJoin)
                 {
-                    string RPath = @"C:\Program Files (x86)\Roblox\Versions\" + AccountManager.CurrentVersion;
-
-                    if (!Directory.Exists(RPath))
-                        RPath = Path.Combine(Environment.GetEnvironmentVariable("LocalAppData"), @"Roblox\Versions\" + AccountManager.CurrentVersion);
-
-                    if (!Directory.Exists(RPath))
+                    string robloxPlayerPath = ResolveRobloxPlayerPath();
+                    if (string.IsNullOrEmpty(robloxPlayerPath))
                         return "ERROR: Failed to find ROBLOX executable";
-
-                    RPath += @"\RobloxPlayerBeta.exe";
 
                     if (!Internal)
                         AccountManager.Instance.NextAccount();
 
                     LastAppLaunch = DateTime.UtcNow;
 
-                    await Task.Run(() =>
-                    {
-                        ProcessStartInfo Roblox = new ProcessStartInfo(RPath);
-                        
-                        if (JoinVIP)
-                            Roblox.Arguments = string.Format("--app -t {0} -j \"https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestPrivateGame&placeId={1}&accessCode={2}&linkCode={3}\"", Ticket, PlaceID, AccessCode, LinkCode);
-                        else if (FollowUser)
-                            Roblox.Arguments = string.Format("--app -t {0} -j \"https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestFollowUser&userId={1}\"", Ticket, PlaceID);
-                        else
-                            Roblox.Arguments = string.Format("--app -t {0} -j \"https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestGame{3}&placeId={1}{2}&isPlayTogetherGame=false\"", Ticket, PlaceID, "&gameId=" + JobID, string.IsNullOrEmpty(JobID) ? "" : "Job");
-                    });
+                    await Task.Run(() => LaunchRobloxPlayerExecutable(robloxPlayerPath, Ticket, launchRequestUrl));
 
                     _ = Task.Run(() => AdjustWindowPosition(ignoredProcessId, LastTinyLaunchSlot, PlaceID));
 
@@ -1017,22 +1045,24 @@ namespace RBX_Alt_Manager
                         {
                             LastAppLaunch = DateTime.UtcNow;
 
-                            ProcessStartInfo LaunchInfo = new ProcessStartInfo();
+                            string protocolLaunchUrl = $"roblox-player:1+launchmode:play+gameinfo:{Ticket}+launchtime:{LaunchTime}+placelauncherurl:{HttpUtility.UrlEncode(launchRequestUrl)}+browsertrackerid:{BrowserTrackerID}+robloxLocale:en_us+gameLocale:en_us+channel:+LaunchExp:InApp";
 
-                            if (JoinVIP)
-                                LaunchInfo.FileName = $"roblox-player:1+launchmode:play+gameinfo:{Ticket}+launchtime:{LaunchTime}+placelauncherurl:{HttpUtility.UrlEncode($"https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestPrivateGame&placeId={PlaceID}&accessCode={AccessCode}&linkCode={LinkCode}")}+browsertrackerid:{BrowserTrackerID}+robloxLocale:en_us+gameLocale:en_us+channel:+LaunchExp:InApp";
-                            else if (FollowUser)
-                                LaunchInfo.FileName = $"roblox-player:1+launchmode:play+gameinfo:{Ticket}+launchtime:{LaunchTime}+placelauncherurl:{HttpUtility.UrlEncode($"https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestFollowUser&userId={PlaceID}")}+browsertrackerid:{BrowserTrackerID}+robloxLocale:en_us+gameLocale:en_us+channel:+LaunchExp:InApp";
-                            else
-                                LaunchInfo.FileName = $"roblox-player:1+launchmode:play+gameinfo:{Ticket}+launchtime:{LaunchTime}+placelauncherurl:{HttpUtility.UrlEncode($"https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestGame{(string.IsNullOrEmpty(JobID) ? "" : "Job")}&browserTrackerId={BrowserTrackerID}&placeId={PlaceID}{(string.IsNullOrEmpty(JobID) ? "" : ("&gameId=" + JobID))}&isPlayTogetherGame=false{(AccountManager.IsTeleport ? "&isTeleport=true" : "")}")}+browsertrackerid:{BrowserTrackerID}+robloxLocale:en_us+gameLocale:en_us+channel:+LaunchExp:InApp";
-                            using (Process Launcher = Process.Start(LaunchInfo))
+                            try
                             {
-                                if (Launcher == null)
-                                    throw new InvalidOperationException("Roblox launcher process failed to start.");
+                                ProcessStartInfo LaunchInfo = new ProcessStartInfo { FileName = protocolLaunchUrl };
+                                using (Process Launcher = Process.Start(LaunchInfo))
+                                {
+                                    if (Launcher == null)
+                                        throw new InvalidOperationException("Roblox launcher process failed to start.");
 
-                                // Keep launch queue highly responsive during bulk launch.
-                                if (!Launcher.WaitForExit(300))
-                                    Program.Logger.Warn($"[JoinServer] Launcher wait timeout for {Username}; continuing launch queue.");
+                                    // Keep launch queue highly responsive during bulk launch.
+                                    if (!Launcher.WaitForExit(300))
+                                        Program.Logger.Warn($"[JoinServer] Launcher wait timeout for {Username}; continuing launch queue.");
+                                }
+                            }
+                            catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1155 || ex.Message.IndexOf("Application not found", StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                LaunchRobloxPlayerExecutable(ResolveRobloxPlayerPath(), Ticket, launchRequestUrl);
                             }
 
                             if (!Internal)
@@ -1059,158 +1089,40 @@ namespace RBX_Alt_Manager
 
         public async void AdjustWindowPosition(int ignoredProcessId = 0, int preferredSlot = -1, long expectedPlaceId = 0)
         {
-            int slot = -1;
-            bool slotReleased = false;
-
             try
             {
-                slot = AcquireTinyLaunchSlot(ignoredProcessId, preferredSlot);
-                (int PosX, int PosY) = GetTinyLaunchGridPosition(slot);
-                int Width = TinyLaunchWidth;
-                int Height = TinyLaunchHeight;
+                bool shouldMoveWindow = false;
+                int posX = 0;
+                int posY = 0;
+                int width = 0;
+                int height = 0;
 
-                bool Found = false;
-                DateTime SearchEnds = DateTime.Now.AddSeconds(45);
-                DateTime EnforceEnds = DateTime.MinValue;
+                if (RobloxWatcher.RememberWindowPositions)
+                    shouldMoveWindow = int.TryParse(GetField("Window_Position_X"), out posX)
+                        && int.TryParse(GetField("Window_Position_Y"), out posY)
+                        && int.TryParse(GetField("Window_Width"), out width)
+                        && int.TryParse(GetField("Window_Height"), out height);
 
-                while (true)
+                DateTime searchEnds = DateTime.Now.AddSeconds(45);
+
+                while (DateTime.Now <= searchEnds)
                 {
-                    await Task.Delay(Found ? 500 : 150);
+                    await Task.Delay(350);
 
-                    Process[] processSnapshot;
-                    try { processSnapshot = Process.GetProcessesByName("RobloxPlayerBeta"); }
-                    catch { processSnapshot = Array.Empty<Process>(); }
+                    IntPtr windowHandle = FindTrackedRobloxWindowHandle(ignoredProcessId);
+                    if (windowHandle == IntPtr.Zero)
+                        continue;
 
-                    var orderedProcesses = processSnapshot
-                        .OrderByDescending(process =>
-                        {
-                            try { return process.StartTime; }
-                            catch { return DateTime.MinValue; }
-                        })
-                        .ToList();
+                    try { ShowWindow(windowHandle, SW_SHOWNOACTIVATE); } catch { }
 
-                    bool allowSingleFallback =
-                        orderedProcesses.Count == 1
-                        && LastAppLaunch != DateTime.MinValue
-                        && (DateTime.UtcNow - LastAppLaunch) <= TimeSpan.FromSeconds(35);
-
-                    foreach (Process process in orderedProcesses)
+                    if (shouldMoveWindow)
                     {
-                        try
-                        {
-                            int processId = 0;
-                            try { processId = process.Id; } catch { }
-                            if (ignoredProcessId > 0 && processId == ignoredProcessId)
-                                continue;
-
-                            if (!TryGetProcessMainWindowHandle(process, out IntPtr mainWindowHandle))
-                                continue;
-
-                            string commandLine = string.Empty;
-                            try { commandLine = process.GetCommandLine() ?? string.Empty; } catch { }
-                            bool trackerMatched = false;
-                            bool launchedAfterCurrentRequest = true;
-
-                            if (LastAppLaunch != DateTime.MinValue && TryGetProcessStartTimeUtc(process, out DateTime processStartUtc))
-                                launchedAfterCurrentRequest = processStartUtc >= LastAppLaunch.AddSeconds(-2);
-
-                            if (!string.IsNullOrWhiteSpace(BrowserTrackerID) && !string.IsNullOrWhiteSpace(commandLine))
-                            {
-                                if (commandLine.IndexOf(BrowserTrackerID, StringComparison.OrdinalIgnoreCase) >= 0)
-                                {
-                                    trackerMatched = true;
-                                }
-                                else
-                                {
-                                    Match trackerMatch = Regex.Match(commandLine, @"(?:\s-b\s+|browsertrackerid[:=\s]+)(\d+)", RegexOptions.IgnoreCase);
-                                    string trackerId = trackerMatch.Success ? trackerMatch.Groups[1].Value : string.Empty;
-                                    trackerMatched = string.Equals(trackerId, BrowserTrackerID, StringComparison.Ordinal);
-                                }
-                            }
-
-                            if (!trackerMatched && CurrentProcessId > 0 && processId == CurrentProcessId && launchedAfterCurrentRequest)
-                                trackerMatched = true;
-
-                            if (trackerMatched && !launchedAfterCurrentRequest)
-                                continue;
-
-                            if (allowSingleFallback && !trackerMatched && !launchedAfterCurrentRequest)
-                                continue;
-
-                            if (!trackerMatched && !allowSingleFallback)
-                                continue;
-
-                            bool readyForTinyShow = HasFreshPlaceJoinSignal(expectedPlaceId, processId, ignoredProcessId);
-                            if (!readyForTinyShow)
-                            {
-                                try
-                                {
-                                    ShowWindow(mainWindowHandle, SW_HIDE);
-                                }
-                                catch { }
-
-                                if (DateTime.Now <= SearchEnds)
-                                    continue;
-                            }
-
-                            Found = true;
-                            LastTinyLaunchSlot = slot;
-                            ClearPendingTinyLaunchIgnoredProcessId(ignoredProcessId);
-
-                            try
-                            {
-                                int style = GetWindowStyle(mainWindowHandle);
-                                int compactStyle = (style & ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU)) | WS_POPUP;
-                                if (compactStyle != style)
-                                    SetWindowStyle(mainWindowHandle, compactStyle);
-
-                                _ = SetWindowPos(
-                                    mainWindowHandle,
-                                    IntPtr.Zero,
-                                    PosX,
-                                    PosY,
-                                    Width,
-                                    Height,
-                                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-                            }
-                            catch
-                            {
-                                MoveWindow(mainWindowHandle, PosX, PosY, Width, Height, true);
-                            }
-
-                            ShowWindow(mainWindowHandle, SW_SHOWNOACTIVATE);
-
-                            if (!slotReleased)
-                            {
-                                ReleaseTinyLaunchSlot(slot);
-                                slotReleased = true;
-                            }
-
-                            try
-                            {
-                                process.PriorityBoostEnabled = false;
-                                if (process.PriorityClass != ProcessPriorityClass.BelowNormal)
-                                    process.PriorityClass = ProcessPriorityClass.BelowNormal;
-                            }
-                            catch { }
-
-                            DateTime extendEnforce = DateTime.Now.AddSeconds(3);
-                            if (extendEnforce > EnforceEnds)
-                                EnforceEnds = extendEnforce;
-
-                            break;
-                        }
-                        finally
-                        {
-                            try { process.Dispose(); } catch { }
-                        }
+                        try { MoveWindow(windowHandle, posX, posY, width, height, true); } catch { }
                     }
 
-                    if (!Found && DateTime.Now > SearchEnds)
-                        break;
-
-                    if (Found && DateTime.Now > EnforceEnds)
-                        break;
+                    ClearPendingTinyLaunchIgnoredProcessId(ignoredProcessId);
+                    LastTinyLaunchSlot = -1;
+                    return;
                 }
             }
             catch (Exception ex)
@@ -1220,10 +1132,75 @@ namespace RBX_Alt_Manager
             finally
             {
                 ClearPendingTinyLaunchIgnoredProcessId(ignoredProcessId);
-
-                if (!slotReleased && slot >= 0)
-                    ReleaseTinyLaunchSlot(slot);
             }
+        }
+
+        private IntPtr FindTrackedRobloxWindowHandle(int ignoredProcessId = 0)
+        {
+            IntPtr fallbackHandle = IntPtr.Zero;
+            DateTime fallbackStartUtc = DateTime.MinValue;
+            DateTime lastLaunchUtc = LastAppLaunch == DateTime.MinValue ? DateTime.MinValue : LastAppLaunch.AddSeconds(-3);
+
+            try
+            {
+                foreach (Process process in Process.GetProcessesByName("RobloxPlayerBeta").Reverse())
+                {
+                    try
+                    {
+                        int processId = 0;
+                        try { processId = process.Id; } catch { }
+                        if (ignoredProcessId > 0 && processId == ignoredProcessId)
+                            continue;
+
+                        if (!TryGetProcessMainWindowHandle(process, out IntPtr mainWindowHandle))
+                            continue;
+
+                        string commandLine = string.Empty;
+                        try { commandLine = process.GetCommandLine() ?? string.Empty; } catch { }
+
+                        bool trackerMatched = false;
+                        if (!string.IsNullOrWhiteSpace(BrowserTrackerID) && !string.IsNullOrWhiteSpace(commandLine))
+                        {
+                            if (commandLine.IndexOf(BrowserTrackerID, StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                trackerMatched = true;
+                            }
+                            else
+                            {
+                                Match trackerMatch = Regex.Match(commandLine, @"(?:\s-b\s+|browsertrackerid[:=\s]+)(\d+)", RegexOptions.IgnoreCase);
+                                string trackerId = trackerMatch.Success ? trackerMatch.Groups[1].Value : string.Empty;
+                                trackerMatched = string.Equals(trackerId, BrowserTrackerID, StringComparison.Ordinal);
+                            }
+                        }
+
+                        if (!trackerMatched && CurrentProcessId > 0 && processId == CurrentProcessId)
+                            trackerMatched = true;
+
+                        if (trackerMatched)
+                            return mainWindowHandle;
+
+                        if (lastLaunchUtc != DateTime.MinValue && TryGetProcessStartTimeUtc(process, out DateTime processStartUtc) && processStartUtc >= lastLaunchUtc && processStartUtc >= fallbackStartUtc)
+                        {
+                            fallbackStartUtc = processStartUtc;
+                            fallbackHandle = mainWindowHandle;
+                        }
+                    }
+                    catch (Exception x)
+                    {
+                        Program.Logger.Warn($"[AdjustWindowPosition] Ignoring process scan error for {Username}: {x.Message}");
+                    }
+                    finally
+                    {
+                        try { process.Dispose(); } catch { }
+                    }
+                }
+            }
+            catch (Exception x)
+            {
+                Program.Logger.Warn($"[AdjustWindowPosition] Failed enumerating Roblox windows for {Username}: {x.Message}");
+            }
+
+            return fallbackHandle;
         }
 
         public string SetServer(long PlaceID, string JobID, out bool Successful)
