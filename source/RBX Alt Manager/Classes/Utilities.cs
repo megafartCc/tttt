@@ -1,5 +1,6 @@
 ﻿using BrightIdeasSoftware;
 using Microsoft.WindowsAPICodePack.Dialogs;
+using Microsoft.Win32;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using RBX_Alt_Manager;
@@ -83,6 +84,254 @@ public static class Utilities
             }
             catch { }
         }, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+    }
+
+    public static string GetConfiguredRobloxInstallPath()
+    {
+        if (AccountManager.General == null || !AccountManager.General.Exists("CustomRobloxInstallPath"))
+            return string.Empty;
+
+        return NormalizeRobloxPathCandidate(AccountManager.General.Get("CustomRobloxInstallPath"));
+    }
+
+    public static string ResolveRobloxPlayerExecutablePath(string preferredPath = null, bool allowFallback = true)
+    {
+        if (TryResolveRobloxExecutablePath(preferredPath, out string executablePath))
+            return executablePath;
+
+        if (!allowFallback)
+            return string.Empty;
+
+        foreach (string candidate in GetDefaultRobloxInstallCandidates(includeConfiguredPath: string.IsNullOrWhiteSpace(preferredPath)))
+        {
+            if (TryResolveRobloxExecutablePath(candidate, out executablePath))
+                return executablePath;
+        }
+
+        return string.Empty;
+    }
+
+    public static string ResolveRobloxVersionDirectory(string preferredPath = null, bool allowFallback = true)
+    {
+        if (TryResolveRobloxVersionDirectory(preferredPath, out string versionDirectory))
+            return versionDirectory;
+
+        if (!allowFallback)
+            return string.Empty;
+
+        foreach (string candidate in GetDefaultRobloxInstallCandidates(includeConfiguredPath: string.IsNullOrWhiteSpace(preferredPath)))
+        {
+            if (TryResolveRobloxVersionDirectory(candidate, out versionDirectory))
+                return versionDirectory;
+        }
+
+        return string.Empty;
+    }
+
+    private static IEnumerable<string> GetDefaultRobloxInstallCandidates(bool includeConfiguredPath)
+    {
+        if (includeConfiguredPath)
+        {
+            string configuredPath = GetConfiguredRobloxInstallPath();
+            if (!string.IsNullOrWhiteSpace(configuredPath))
+                yield return configuredPath;
+        }
+
+        string currentVersion = (AccountManager.CurrentVersion ?? string.Empty).Trim();
+        string localAppData = Environment.GetEnvironmentVariable("LocalAppData") ?? string.Empty;
+
+        if (!string.IsNullOrWhiteSpace(currentVersion))
+        {
+            yield return Path.Combine(@"C:\Program Files (x86)\Roblox\Versions", currentVersion);
+
+            if (!string.IsNullOrWhiteSpace(localAppData))
+                yield return Path.Combine(localAppData, @"Roblox\Versions", currentVersion);
+        }
+
+        string registryPath = Registry.ClassesRoot.OpenSubKey(@"roblox\DefaultIcon")?.GetValue("") as string;
+        if (!string.IsNullOrWhiteSpace(registryPath))
+            yield return registryPath;
+
+        yield return @"C:\Program Files (x86)\Roblox";
+        yield return @"C:\Program Files (x86)\Roblox\Versions";
+
+        if (!string.IsNullOrWhiteSpace(localAppData))
+        {
+            yield return Path.Combine(localAppData, "Roblox");
+            yield return Path.Combine(localAppData, @"Roblox\Versions");
+        }
+    }
+
+    private static bool TryResolveRobloxExecutablePath(string rawPath, out string executablePath)
+    {
+        executablePath = string.Empty;
+
+        string candidatePath = NormalizeRobloxPathCandidate(rawPath);
+        if (string.IsNullOrWhiteSpace(candidatePath))
+            return false;
+
+        if (File.Exists(candidatePath))
+        {
+            string fileName = Path.GetFileName(candidatePath);
+            if (IsRobloxExecutableName(fileName))
+            {
+                executablePath = candidatePath;
+                return true;
+            }
+        }
+
+        if (!TryResolveRobloxVersionDirectory(candidatePath, out string versionDirectory))
+            return false;
+
+        foreach (string executableName in new[] { "RobloxPlayerBeta.exe", "RobloxPlayerLauncher.exe" })
+        {
+            string fullPath = Path.Combine(versionDirectory, executableName);
+            if (File.Exists(fullPath))
+            {
+                executablePath = fullPath;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryResolveRobloxVersionDirectory(string rawPath, out string versionDirectory)
+    {
+        versionDirectory = string.Empty;
+
+        string candidatePath = NormalizeRobloxPathCandidate(rawPath);
+        if (string.IsNullOrWhiteSpace(candidatePath))
+            return false;
+
+        if (File.Exists(candidatePath))
+        {
+            string fileName = Path.GetFileName(candidatePath);
+            if (IsRobloxExecutableName(fileName))
+            {
+                versionDirectory = Path.GetDirectoryName(candidatePath) ?? string.Empty;
+                return !string.IsNullOrWhiteSpace(versionDirectory) && Directory.Exists(versionDirectory);
+            }
+
+            return false;
+        }
+
+        if (!Directory.Exists(candidatePath))
+            return false;
+
+        if (DirectoryHasRobloxExecutable(candidatePath))
+        {
+            versionDirectory = candidatePath;
+            return true;
+        }
+
+        string currentVersion = (AccountManager.CurrentVersion ?? string.Empty).Trim();
+        if (!string.IsNullOrWhiteSpace(currentVersion))
+        {
+            string directCurrent = Path.Combine(candidatePath, currentVersion);
+            if (DirectoryHasRobloxExecutable(directCurrent))
+            {
+                versionDirectory = directCurrent;
+                return true;
+            }
+
+            string nestedCurrent = Path.Combine(candidatePath, "Versions", currentVersion);
+            if (DirectoryHasRobloxExecutable(nestedCurrent))
+            {
+                versionDirectory = nestedCurrent;
+                return true;
+            }
+        }
+
+        string newestCandidate = string.Empty;
+        DateTime newestTimestamp = DateTime.MinValue;
+
+        foreach (string directChild in EnumerateRobloxVersionDirectories(candidatePath))
+        {
+            if (!string.IsNullOrWhiteSpace(currentVersion)
+                && string.Equals(Path.GetFileName(directChild), currentVersion, StringComparison.OrdinalIgnoreCase))
+            {
+                versionDirectory = directChild;
+                return true;
+            }
+
+            DateTime lastWriteUtc = GetDirectoryLastWriteUtcSafe(directChild);
+            if (string.IsNullOrWhiteSpace(newestCandidate) || lastWriteUtc >= newestTimestamp)
+            {
+                newestCandidate = directChild;
+                newestTimestamp = lastWriteUtc;
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(newestCandidate))
+        {
+            versionDirectory = newestCandidate;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static IEnumerable<string> EnumerateRobloxVersionDirectories(string rootPath)
+    {
+        foreach (string child in GetDirectoryChildrenSafe(rootPath))
+        {
+            if (DirectoryHasRobloxExecutable(child))
+                yield return child;
+        }
+
+        string versionsDirectory = Path.Combine(rootPath, "Versions");
+        foreach (string child in GetDirectoryChildrenSafe(versionsDirectory))
+        {
+            if (DirectoryHasRobloxExecutable(child))
+                yield return child;
+        }
+    }
+
+    private static IEnumerable<string> GetDirectoryChildrenSafe(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !Directory.Exists(path))
+            return Array.Empty<string>();
+
+        try { return Directory.GetDirectories(path); }
+        catch { return Array.Empty<string>(); }
+    }
+
+    private static DateTime GetDirectoryLastWriteUtcSafe(string path)
+    {
+        try { return Directory.GetLastWriteTimeUtc(path); }
+        catch { return DateTime.MinValue; }
+    }
+
+    private static bool DirectoryHasRobloxExecutable(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !Directory.Exists(path))
+            return false;
+
+        return File.Exists(Path.Combine(path, "RobloxPlayerBeta.exe"))
+            || File.Exists(Path.Combine(path, "RobloxPlayerLauncher.exe"));
+    }
+
+    private static bool IsRobloxExecutableName(string fileName)
+    {
+        return string.Equals(fileName, "RobloxPlayerBeta.exe", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(fileName, "RobloxPlayerLauncher.exe", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string NormalizeRobloxPathCandidate(string rawPath)
+    {
+        string candidatePath = (rawPath ?? string.Empty).Trim().Trim('"');
+        if (string.IsNullOrWhiteSpace(candidatePath))
+            return string.Empty;
+
+        int iconSuffixIndex = candidatePath.IndexOf(',');
+        if (iconSuffixIndex > 1 && !File.Exists(candidatePath))
+            candidatePath = candidatePath.Substring(0, iconSuffixIndex);
+
+        candidatePath = candidatePath.Trim().Trim('"');
+
+        try { return Path.GetFullPath(candidatePath); }
+        catch { return candidatePath; }
     }
 
     public static string MD5(string input)

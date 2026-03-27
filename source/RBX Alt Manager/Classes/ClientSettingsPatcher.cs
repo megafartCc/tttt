@@ -1,4 +1,3 @@
-using Microsoft.Win32;
 using Newtonsoft.Json.Linq;
 using System;
 using System.IO;
@@ -9,24 +8,15 @@ namespace RBX_Alt_Manager.Classes
     {
         private static DirectoryInfo ResolveRobloxVersionFolder()
         {
-            string rawPath = Registry.ClassesRoot.OpenSubKey(@"roblox\DefaultIcon")?.GetValue("") as string;
-            if (string.IsNullOrWhiteSpace(rawPath))
+            string configuredPath = Utilities.GetConfiguredRobloxInstallPath();
+            string resolvedPath = Utilities.ResolveRobloxVersionDirectory(
+                configuredPath,
+                allowFallback: string.IsNullOrWhiteSpace(configuredPath));
+
+            if (string.IsNullOrWhiteSpace(resolvedPath))
                 return null;
 
-            string candidatePath = rawPath.Trim().Trim('"');
-            int iconSuffixIndex = candidatePath.IndexOf(',');
-            if (iconSuffixIndex > 1 && !File.Exists(candidatePath))
-                candidatePath = candidatePath.Substring(0, iconSuffixIndex);
-
-            candidatePath = candidatePath.Trim().Trim('"');
-
-            if (File.Exists(candidatePath))
-                return Directory.GetParent(candidatePath);
-
-            if (Directory.Exists(candidatePath))
-                return new DirectoryInfo(candidatePath);
-
-            return null;
+            return new DirectoryInfo(resolvedPath);
         }
 
         public static void PatchSettings()
@@ -40,9 +30,6 @@ namespace RBX_Alt_Manager.Classes
 
             DirectoryInfo VersionFolder = ResolveRobloxVersionFolder();
             if (VersionFolder == null || !VersionFolder.Exists)
-                return;
-
-            if (!VersionFolder.Name.StartsWith("version-", StringComparison.OrdinalIgnoreCase))
                 return;
 
             bool hasPlayerBinary =

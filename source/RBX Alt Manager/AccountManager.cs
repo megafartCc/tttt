@@ -253,6 +253,7 @@ namespace RBX_Alt_Manager
             if (!General.Exists("ManagerPriority")) General.Set("ManagerPriority", "AboveNormal");
             if (!General.Exists("ProcessLassoPath")) General.Set("ProcessLassoPath", @"C:\Program Files\Process Lasso\ProcessLasso.exe");
             if (!General.Exists("RAMMapPath")) General.Set("RAMMapPath", @"C:\Sysinternals\RAMMap.exe");
+            if (!General.Exists("CustomRobloxInstallPath")) General.Set("CustomRobloxInstallPath", "");
             if (!General.Exists("UnlockFPS")) General.Set("UnlockFPS", "false");
             if (!General.Exists("MaxFPSValue")) General.Set("MaxFPSValue", "120");
             if (!General.Exists("UseCefSharpBrowser")) General.Set("UseCefSharpBrowser", "false");

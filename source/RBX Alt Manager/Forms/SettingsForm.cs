@@ -30,6 +30,10 @@ namespace RBX_Alt_Manager.Forms
         private Label RAMMapPathLabel;
         private TextBox RAMMapPathTB;
         private Button OpenRAMMapButton;
+        private Label CustomRobloxPathLabel;
+        private TextBox CustomRobloxPathTB;
+        private Button BrowseCustomRobloxPathButton;
+        private Button ClearCustomRobloxPathButton;
         private Label MemoryMonitorLabel;
         private Timer PerformanceMonitorTimer;
         private const long AutoRejoinPlaceId = 109983668079237;
@@ -203,6 +207,35 @@ namespace RBX_Alt_Manager.Forms
             };
             OpenRAMMapButton.Click += OpenRAMMapButton_Click;
 
+            CustomRobloxPathLabel = new Label
+            {
+                AutoSize = true,
+                Text = "Custom Roblox Install Path"
+            };
+
+            CustomRobloxPathTB = new TextBox
+            {
+                Name = "CustomRobloxPathTB",
+                Width = 269
+            };
+            CustomRobloxPathTB.TextChanged += CustomRobloxPathTB_TextChanged;
+
+            BrowseCustomRobloxPathButton = new Button
+            {
+                Name = "BrowseCustomRobloxPathButton",
+                Text = "Browse Roblox Folder",
+                Width = 131
+            };
+            BrowseCustomRobloxPathButton.Click += BrowseCustomRobloxPathButton_Click;
+
+            ClearCustomRobloxPathButton = new Button
+            {
+                Name = "ClearCustomRobloxPathButton",
+                Text = "Use Default Path",
+                Width = 131
+            };
+            ClearCustomRobloxPathButton.Click += ClearCustomRobloxPathButton_Click;
+
             MemoryMonitorLabel = new Label
             {
                 AutoSize = true,
@@ -217,6 +250,10 @@ namespace RBX_Alt_Manager.Forms
             Helper.SetToolTip(RobloxAffinityMaskTB, "Example: FF (cores 1-8), F0, 0x3F. Leave empty to use all cores.");
             Helper.SetToolTip(OpenProcessLassoButton, "Open configured Process Lasso path, or its official site if missing.");
             Helper.SetToolTip(OpenRAMMapButton, "Open configured RAMMap path, or Microsoft docs if missing.");
+            Helper.SetToolTip(CustomRobloxPathLabel, "Optional. Point RAMV2 at a custom Roblox version folder, Roblox root folder, or paste RobloxPlayerBeta.exe into the box below.");
+            Helper.SetToolTip(CustomRobloxPathTB, "Examples: C:\\Users\\you\\AppData\\Local\\Roblox\\Versions\\version-xxx or a direct RobloxPlayerBeta.exe path.");
+            Helper.SetToolTip(BrowseCustomRobloxPathButton, "Choose a Roblox install folder. RAMV2 will launch from this path instead of the default protocol handler.");
+            Helper.SetToolTip(ClearCustomRobloxPathButton, "Clear the custom path and go back to the normal Roblox install lookup.");
 
             MiscellaneousFlowPanel.Controls.Remove(ForceUpdateButton);
 
@@ -249,6 +286,13 @@ namespace RBX_Alt_Manager.Forms
             MiscellaneousFlowPanel.SetFlowBreak(RAMMapPathTB, true);
             MiscellaneousFlowPanel.Controls.Add(OpenRAMMapButton);
             MiscellaneousFlowPanel.SetFlowBreak(OpenRAMMapButton, true);
+            MiscellaneousFlowPanel.Controls.Add(CustomRobloxPathLabel);
+            MiscellaneousFlowPanel.SetFlowBreak(CustomRobloxPathLabel, true);
+            MiscellaneousFlowPanel.Controls.Add(CustomRobloxPathTB);
+            MiscellaneousFlowPanel.SetFlowBreak(CustomRobloxPathTB, true);
+            MiscellaneousFlowPanel.Controls.Add(BrowseCustomRobloxPathButton);
+            MiscellaneousFlowPanel.Controls.Add(ClearCustomRobloxPathButton);
+            MiscellaneousFlowPanel.SetFlowBreak(ClearCustomRobloxPathButton, true);
             MiscellaneousFlowPanel.Controls.Add(MemoryMonitorLabel);
             MiscellaneousFlowPanel.SetFlowBreak(MemoryMonitorLabel, true);
 
@@ -382,6 +426,7 @@ namespace RBX_Alt_Manager.Forms
             SetComboValue(ManagerPriorityCombo, AccountManager.General.Get("ManagerPriority"), "AboveNormal");
             ProcessLassoPathTB.Text = AccountManager.General.Get("ProcessLassoPath");
             RAMMapPathTB.Text = AccountManager.General.Get("RAMMapPath");
+            CustomRobloxPathTB.Text = AccountManager.General.Get("CustomRobloxInstallPath");
             UpdateMemoryMonitor();
             PerformanceMonitorTimer.Start();
 
@@ -733,6 +778,14 @@ namespace RBX_Alt_Manager.Forms
             AccountManager.IniSettings.Save("RAMSettings.ini");
         }
 
+        private void CustomRobloxPathTB_TextChanged(object sender, EventArgs e)
+        {
+            if (!SettingsLoaded) return;
+
+            AccountManager.General.Set("CustomRobloxInstallPath", (CustomRobloxPathTB.Text ?? string.Empty).Trim());
+            AccountManager.IniSettings.Save("RAMSettings.ini");
+        }
+
         private void OpenProcessLassoButton_Click(object sender, EventArgs e)
         {
             OpenToolOrWebsite(ProcessLassoPathTB.Text, "https://bitsum.com/");
@@ -741,6 +794,29 @@ namespace RBX_Alt_Manager.Forms
         private void OpenRAMMapButton_Click(object sender, EventArgs e)
         {
             OpenToolOrWebsite(RAMMapPathTB.Text, "https://learn.microsoft.com/en-us/sysinternals/downloads/rammap");
+        }
+
+        private void BrowseCustomRobloxPathButton_Click(object sender, EventArgs e)
+        {
+            using FolderBrowserDialog dialog = new FolderBrowserDialog
+            {
+                Description = "Select the Roblox version folder or Roblox install root."
+            };
+
+            string currentPath = (CustomRobloxPathTB.Text ?? string.Empty).Trim().Trim('"');
+            if (File.Exists(currentPath))
+                currentPath = Path.GetDirectoryName(currentPath) ?? string.Empty;
+
+            if (Directory.Exists(currentPath))
+                dialog.SelectedPath = currentPath;
+
+            if (dialog.ShowDialog(this) == DialogResult.OK)
+                CustomRobloxPathTB.Text = dialog.SelectedPath;
+        }
+
+        private void ClearCustomRobloxPathButton_Click(object sender, EventArgs e)
+        {
+            CustomRobloxPathTB.Text = string.Empty;
         }
 
         private void OverrideWithCustomCB_CheckedChanged(object sender, EventArgs e)

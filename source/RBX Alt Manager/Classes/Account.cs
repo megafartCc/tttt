@@ -867,20 +867,12 @@ namespace RBX_Alt_Manager
             return $"https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestGame{(string.IsNullOrEmpty(jobId) ? "" : "Job")}&browserTrackerId={BrowserTrackerID}&placeId={placeId}{(string.IsNullOrEmpty(jobId) ? "" : ("&gameId=" + jobId))}&isPlayTogetherGame=false{(AccountManager.IsTeleport ? "&isTeleport=true" : "")}";
         }
 
-        private static string ResolveRobloxPlayerPath()
+        private static string ResolveRobloxPlayerPath(string preferredPath = null, bool allowFallback = true)
         {
-            string versionPath = Path.Combine(@"C:\Program Files (x86)\Roblox\Versions", AccountManager.CurrentVersion ?? string.Empty);
-            if (!Directory.Exists(versionPath))
-                versionPath = Path.Combine(Environment.GetEnvironmentVariable("LocalAppData") ?? string.Empty, @"Roblox\Versions", AccountManager.CurrentVersion ?? string.Empty);
-
-            if (!Directory.Exists(versionPath))
-                return string.Empty;
-
-            string executablePath = Path.Combine(versionPath, "RobloxPlayerBeta.exe");
-            return File.Exists(executablePath) ? executablePath : string.Empty;
+            return Utilities.ResolveRobloxPlayerExecutablePath(preferredPath, allowFallback);
         }
 
-        private static void LaunchRobloxPlayerExecutable(string executablePath, string ticket, string launchRequestUrl)
+        private static void LaunchRobloxPlayerExecutable(string executablePath, string ticket, string launchRequestUrl, string browserTrackerId = "")
         {
             if (string.IsNullOrWhiteSpace(executablePath))
                 throw new FileNotFoundException("Failed to find ROBLOX executable.");
@@ -888,7 +880,7 @@ namespace RBX_Alt_Manager
             ProcessStartInfo roblox = new ProcessStartInfo(executablePath)
             {
                 UseShellExecute = false,
-                Arguments = $"--app -t {ticket} -j \"{launchRequestUrl}\""
+                Arguments = $"--app -t {ticket}{(string.IsNullOrWhiteSpace(browserTrackerId) ? string.Empty : $" -b {browserTrackerId}")} -j \"{launchRequestUrl}\""
             };
 
             Process launchedProcess = Process.Start(roblox);
@@ -1017,19 +1009,25 @@ namespace RBX_Alt_Manager
                 double LaunchTime = Math.Floor((DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalSeconds * 1000);
 
                 string launchRequestUrl = BuildLaunchRequestUrl(PlaceID, JobID, FollowUser, JoinVIP, AccessCode, LinkCode);
+                string configuredRobloxPath = Utilities.GetConfiguredRobloxInstallPath();
+                bool useCustomRobloxPath = !string.IsNullOrWhiteSpace(configuredRobloxPath);
 
                 if (AccountManager.UseOldJoin)
                 {
-                    string robloxPlayerPath = ResolveRobloxPlayerPath();
+                    string robloxPlayerPath = ResolveRobloxPlayerPath(
+                        useCustomRobloxPath ? configuredRobloxPath : null,
+                        allowFallback: !useCustomRobloxPath);
                     if (string.IsNullOrEmpty(robloxPlayerPath))
-                        return "ERROR: Failed to find ROBLOX executable";
+                        return useCustomRobloxPath
+                            ? "ERROR: Failed to find ROBLOX executable in the configured custom Roblox path."
+                            : "ERROR: Failed to find ROBLOX executable";
 
                     if (!Internal)
                         AccountManager.Instance.NextAccount();
 
                     LastAppLaunch = DateTime.UtcNow;
 
-                    await Task.Run(() => LaunchRobloxPlayerExecutable(robloxPlayerPath, Ticket, launchRequestUrl));
+                    await Task.Run(() => LaunchRobloxPlayerExecutable(robloxPlayerPath, Ticket, launchRequestUrl, BrowserTrackerID));
 
                     _ = Task.Run(() => AdjustWindowPosition(ignoredProcessId, LastTinyLaunchSlot, PlaceID));
 
@@ -1045,24 +1043,35 @@ namespace RBX_Alt_Manager
                         {
                             LastAppLaunch = DateTime.UtcNow;
 
-                            string protocolLaunchUrl = $"roblox-player:1+launchmode:play+gameinfo:{Ticket}+launchtime:{LaunchTime}+placelauncherurl:{HttpUtility.UrlEncode(launchRequestUrl)}+browsertrackerid:{BrowserTrackerID}+robloxLocale:en_us+gameLocale:en_us+channel:+LaunchExp:InApp";
-
-                            try
+                            if (useCustomRobloxPath)
                             {
-                                ProcessStartInfo LaunchInfo = new ProcessStartInfo { FileName = protocolLaunchUrl };
-                                using (Process Launcher = Process.Start(LaunchInfo))
-                                {
-                                    if (Launcher == null)
-                                        throw new InvalidOperationException("Roblox launcher process failed to start.");
+                                string robloxPlayerPath = ResolveRobloxPlayerPath(configuredRobloxPath, allowFallback: false);
+                                if (string.IsNullOrWhiteSpace(robloxPlayerPath))
+                                    throw new FileNotFoundException("Failed to find ROBLOX executable in the configured custom Roblox path.");
 
-                                    // Keep launch queue highly responsive during bulk launch.
-                                    if (!Launcher.WaitForExit(300))
-                                        Program.Logger.Warn($"[JoinServer] Launcher wait timeout for {Username}; continuing launch queue.");
-                                }
+                                LaunchRobloxPlayerExecutable(robloxPlayerPath, Ticket, launchRequestUrl, BrowserTrackerID);
                             }
-                            catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1155 || ex.Message.IndexOf("Application not found", StringComparison.OrdinalIgnoreCase) >= 0)
+                            else
                             {
-                                LaunchRobloxPlayerExecutable(ResolveRobloxPlayerPath(), Ticket, launchRequestUrl);
+                                string protocolLaunchUrl = $"roblox-player:1+launchmode:play+gameinfo:{Ticket}+launchtime:{LaunchTime}+placelauncherurl:{HttpUtility.UrlEncode(launchRequestUrl)}+browsertrackerid:{BrowserTrackerID}+robloxLocale:en_us+gameLocale:en_us+channel:+LaunchExp:InApp";
+
+                                try
+                                {
+                                    ProcessStartInfo LaunchInfo = new ProcessStartInfo { FileName = protocolLaunchUrl };
+                                    using (Process Launcher = Process.Start(LaunchInfo))
+                                    {
+                                        if (Launcher == null)
+                                            throw new InvalidOperationException("Roblox launcher process failed to start.");
+
+                                        // Keep launch queue highly responsive during bulk launch.
+                                        if (!Launcher.WaitForExit(300))
+                                            Program.Logger.Warn($"[JoinServer] Launcher wait timeout for {Username}; continuing launch queue.");
+                                    }
+                                }
+                                catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1155 || ex.Message.IndexOf("Application not found", StringComparison.OrdinalIgnoreCase) >= 0)
+                                {
+                                    LaunchRobloxPlayerExecutable(ResolveRobloxPlayerPath(), Ticket, launchRequestUrl, BrowserTrackerID);
+                                }
                             }
 
                             if (!Internal)
