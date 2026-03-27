@@ -872,6 +872,22 @@ namespace RBX_Alt_Manager
             return Utilities.ResolveRobloxPlayerExecutablePath(preferredPath, allowFallback);
         }
 
+        private static string ResolveLaunchRobloxPlayerPath(string configuredPath, out bool fellBackToDefaultInstall)
+        {
+            fellBackToDefaultInstall = false;
+
+            if (!string.IsNullOrWhiteSpace(configuredPath))
+            {
+                string preferredPath = ResolveRobloxPlayerPath(configuredPath, allowFallback: false);
+                if (!string.IsNullOrWhiteSpace(preferredPath))
+                    return preferredPath;
+
+                fellBackToDefaultInstall = true;
+            }
+
+            return ResolveRobloxPlayerPath();
+        }
+
         private static void LaunchRobloxPlayerExecutable(string executablePath, string ticket, string launchRequestUrl, string browserTrackerId = "")
         {
             if (string.IsNullOrWhiteSpace(executablePath))
@@ -1014,13 +1030,15 @@ namespace RBX_Alt_Manager
 
                 if (AccountManager.UseOldJoin)
                 {
-                    string robloxPlayerPath = ResolveRobloxPlayerPath(
+                    string robloxPlayerPath = ResolveLaunchRobloxPlayerPath(
                         useCustomRobloxPath ? configuredRobloxPath : null,
-                        allowFallback: !useCustomRobloxPath);
+                        out bool fellBackToDefaultInstall);
+
+                    if (fellBackToDefaultInstall)
+                        Program.Logger.Warn($"[JoinServer] Custom Roblox path is invalid or missing: {configuredRobloxPath}. Falling back to the default Roblox install.");
+
                     if (string.IsNullOrEmpty(robloxPlayerPath))
-                        return useCustomRobloxPath
-                            ? "ERROR: Failed to find ROBLOX executable in the configured custom Roblox path."
-                            : "ERROR: Failed to find ROBLOX executable";
+                        return "ERROR: Failed to find ROBLOX executable";
 
                     if (!Internal)
                         AccountManager.Instance.NextAccount();
@@ -1045,9 +1063,12 @@ namespace RBX_Alt_Manager
 
                             if (useCustomRobloxPath)
                             {
-                                string robloxPlayerPath = ResolveRobloxPlayerPath(configuredRobloxPath, allowFallback: false);
+                                string robloxPlayerPath = ResolveLaunchRobloxPlayerPath(configuredRobloxPath, out bool fellBackToDefaultInstall);
                                 if (string.IsNullOrWhiteSpace(robloxPlayerPath))
-                                    throw new FileNotFoundException("Failed to find ROBLOX executable in the configured custom Roblox path.");
+                                    throw new FileNotFoundException("Failed to find ROBLOX executable.");
+
+                                if (fellBackToDefaultInstall)
+                                    Program.Logger.Warn($"[JoinServer] Custom Roblox path is invalid or missing: {configuredRobloxPath}. Falling back to the default Roblox install.");
 
                                 LaunchRobloxPlayerExecutable(robloxPlayerPath, Ticket, launchRequestUrl, BrowserTrackerID);
                             }

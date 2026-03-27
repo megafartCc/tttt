@@ -13,6 +13,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using WebSocketSharp;
+using PuppeteerSharp;
 
 namespace RBX_Alt_Manager
 {
@@ -27,6 +28,7 @@ namespace RBX_Alt_Manager
         public static bool Elevated;
         private static readonly object CrashLogLock = new object();
         private static int ThreadExceptionCount;
+        private static DateTime LastSuppressedPuppeteerNoiseUtc = DateTime.MinValue;
         public static float Scale
         {
             get
@@ -143,6 +145,12 @@ namespace RBX_Alt_Manager
 
             TaskScheduler.UnobservedTaskException += (s, e) =>
             {
+                if (ShouldSuppressUnobservedTaskException(e.Exception))
+                {
+                    e.SetObserved();
+                    return;
+                }
+
                 LogUnhandledException("TaskScheduler", e.Exception, false);
                 e.SetObserved();
             };
@@ -244,6 +252,49 @@ namespace RBX_Alt_Manager
                     File.AppendAllText(crashPath, payload);
             }
             catch { }
+        }
+
+        private static bool ShouldSuppressUnobservedTaskException(Exception exception)
+        {
+            AggregateException aggregate = exception as AggregateException;
+            if (aggregate == null)
+                return false;
+
+            AggregateException flattened = aggregate.Flatten();
+            if (flattened.InnerExceptions == null || flattened.InnerExceptions.Count == 0)
+                return false;
+
+            foreach (Exception inner in flattened.InnerExceptions)
+                if (!IsKnownPuppeteerRedirectNoise(inner))
+                    return false;
+
+            DateTime nowUtc = DateTime.UtcNow;
+
+            if ((nowUtc - LastSuppressedPuppeteerNoiseUtc).TotalSeconds >= 30)
+            {
+                LastSuppressedPuppeteerNoiseUtc = nowUtc;
+
+                try
+                {
+                    Logger.Warn("[Unhandled:TaskScheduler] Suppressed non-fatal Puppeteer redirect-response noise.");
+                }
+                catch { }
+            }
+
+            return true;
+        }
+
+        private static bool IsKnownPuppeteerRedirectNoise(Exception ex)
+        {
+            while (ex != null)
+            {
+                if (ex is PuppeteerException && ex.Message?.IndexOf("Response body is unavailable for redirect responses", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
+
+                ex = ex.InnerException;
+            }
+
+            return false;
         }
     }
 }

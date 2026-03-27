@@ -32,6 +32,7 @@ namespace RBX_Alt_Manager.Classes
         private string Password;
         private bool AccountCaptured;
         private bool AccountCaptureInProgress;
+        private DateTime LastImportFailureLogUtc = DateTime.MinValue;
 
         public Browser browser;
         public Page page;
@@ -198,6 +199,7 @@ namespace RBX_Alt_Manager.Classes
 
                 if (!string.IsNullOrEmpty(Username) && !string.IsNullOrEmpty(Password)) await page.ClickAsync("#login-button");
             }
+            catch (Exception ex) when (AccountCaptured || page == null || page.IsClosed || IsBrowserShutdownException(ex)) { }
             catch (Exception ex) { Program.Logger.Error($"An exception was caught while trying to automatically log in: {ex}"); }
         }
 
@@ -207,6 +209,30 @@ namespace RBX_Alt_Manager.Classes
             {
                 if (ex is PuppeteerException && ex.Message?.IndexOf("Response body is unavailable for redirect responses", StringComparison.OrdinalIgnoreCase) >= 0)
                     return true;
+
+                ex = ex.InnerException;
+            }
+
+            return false;
+        }
+
+        private static bool IsBrowserShutdownException(Exception ex)
+        {
+            while (ex != null)
+            {
+                if (ex is TargetClosedException)
+                    return true;
+
+                if (ex is PuppeteerException)
+                {
+                    string message = ex.Message ?? string.Empty;
+
+                    if (message.IndexOf("Target closed", StringComparison.OrdinalIgnoreCase) >= 0
+                        || message.IndexOf("Target.detachedFromTarget", StringComparison.OrdinalIgnoreCase) >= 0
+                        || message.IndexOf("browser has disconnected", StringComparison.OrdinalIgnoreCase) >= 0
+                        || message.IndexOf("Session closed", StringComparison.OrdinalIgnoreCase) >= 0)
+                        return true;
+                }
 
                 ex = ex.InnerException;
             }
@@ -238,7 +264,9 @@ namespace RBX_Alt_Manager.Classes
                         {
                             await Task.Delay(500);
 
-                            if (e.Frame.QuerySelectorAsync("#app") == null && e.Frame.QuerySelectorAsync("#root") == null) continue;
+                            var appRoot = await e.Frame.QuerySelectorAsync("#app");
+                            var root = appRoot ?? await e.Frame.QuerySelectorAsync("#root");
+                            if (appRoot == null && root == null) continue;
 
                             try // :|
                             {
@@ -318,6 +346,7 @@ namespace RBX_Alt_Manager.Classes
                     catch { } // Ignore exceptions
                 }
             }
+            catch (Exception x) when (IsBrowserShutdownException(x) || IsRedirectResponseException(x)) { }
             catch (Exception x)
             {
                 Program.Logger.Warn($"[AccountBrowser] Page_FrameAttached failed: {x.Message}");
@@ -349,10 +378,8 @@ namespace RBX_Alt_Manager.Classes
                         }
                     }
                 }
-                catch (PuppeteerException x) when (IsRedirectResponseException(x))
-                {
-                    Program.Logger.Warn("[AccountBrowser] Ignoring redirect response while monitoring login completion.");
-                }
+                catch (PuppeteerException x) when (IsRedirectResponseException(x)) { }
+                catch (Exception x) when (IsBrowserShutdownException(x)) { return; }
                 catch (Exception x)
                 {
                     Program.Logger.Warn($"[AccountBrowser] MonitorLoginCompletion failed: {x.Message}");
@@ -384,10 +411,8 @@ namespace RBX_Alt_Manager.Classes
                 if (!string.IsNullOrWhiteSpace(password))
                     Password = password;
             }
-            catch (PuppeteerException x) when (IsRedirectResponseException(x))
-            {
-                Program.Logger.Warn("[AccountBrowser] Ignoring redirect response while capturing password.");
-            }
+            catch (PuppeteerException x) when (IsRedirectResponseException(x)) { }
+            catch (Exception x) when (IsBrowserShutdownException(x)) { }
             catch { }
         }
 
@@ -412,14 +437,98 @@ namespace RBX_Alt_Manager.Classes
                     await TryCapturePasswordFromPage();
                 }
             }
-            catch (PuppeteerException x) when (IsRedirectResponseException(x))
-            {
-                Program.Logger.Warn("[AccountBrowser] Ignoring redirect response while handling RequestFinished.");
-            }
+            catch (PuppeteerException x) when (IsRedirectResponseException(x)) { }
+            catch (Exception x) when (IsBrowserShutdownException(x)) { }
             catch (Exception x)
             {
                 Program.Logger.Warn($"[AccountBrowser] Page_RequestFinished failed: {x.Message}");
             }
+        }
+
+        private async Task<string> TryGetAuthenticatedAccountJsonFromPage()
+        {
+            if (page == null || page.IsClosed)
+                return null;
+
+            try
+            {
+                string responseJson = await page.EvaluateFunctionAsync<string>(
+                    @"() => fetch('/my/account/json', { credentials: 'include', cache: 'no-store' })
+                        .then(async response => JSON.stringify({
+                            ok: response.ok,
+                            status: response.status,
+                            text: await response.text()
+                        }))");
+
+                if (string.IsNullOrWhiteSpace(responseJson) || !Utilities.TryParseJson(responseJson, out JObject payload))
+                    return null;
+
+                if (!(payload?["ok"]?.Value<bool>() ?? false))
+                    return null;
+
+                string accountJson = payload?["text"]?.Value<string>();
+                if (string.IsNullOrWhiteSpace(accountJson))
+                    return null;
+
+                if (!Utilities.TryParseJson(accountJson, out AccountJson accountData))
+                    return null;
+
+                if (accountData == null || accountData.UserId <= 0 || string.IsNullOrWhiteSpace(accountData.Name))
+                    return null;
+
+                return accountJson;
+            }
+            catch (PuppeteerException x) when (IsRedirectResponseException(x)) { }
+            catch (Exception x) when (IsBrowserShutdownException(x)) { }
+            catch { }
+
+            return null;
+        }
+
+        private void LogImportRetryFailure()
+        {
+            if ((DateTime.UtcNow - LastImportFailureLogUtc).TotalSeconds < 10)
+                return;
+
+            LastImportFailureLogUtc = DateTime.UtcNow;
+            Program.Logger.Warn("[AccountBrowser] Cookie captured but account import failed.");
+        }
+
+        private async Task CloseBrowserAfterCapture()
+        {
+            Page activePage = page;
+            Browser activeBrowser = browser;
+
+            page = null;
+            browser = null;
+
+            try
+            {
+                if (activePage != null)
+                    activePage.FrameAttached -= Page_FrameAttached;
+            }
+            catch { }
+
+            try
+            {
+                if (activePage != null && !activePage.IsClosed)
+                    await activePage.CloseAsync();
+            }
+            catch (Exception x) when (IsBrowserShutdownException(x) || IsRedirectResponseException(x)) { }
+
+            try
+            {
+                if (activeBrowser?.IsConnected == true)
+                    await activeBrowser.CloseAsync();
+            }
+            catch (Exception x) when (IsBrowserShutdownException(x) || IsRedirectResponseException(x)) { }
+
+            try
+            {
+                if (activeBrowser != null)
+                    await activeBrowser.DisposeAsync();
+            }
+            catch (Exception x) when (IsBrowserShutdownException(x) || IsRedirectResponseException(x)) { }
         }
 
         private async Task<bool> AddAccount(CookieParam SecurityToken)
@@ -427,34 +536,24 @@ namespace RBX_Alt_Manager.Classes
             if (SecurityToken == null || string.IsNullOrWhiteSpace(SecurityToken.Value))
                 return false;
 
-            Account AddedAccount;
+            string accountJson = await TryGetAuthenticatedAccountJsonFromPage();
+            if (string.IsNullOrWhiteSpace(accountJson))
+                return false;
 
-            if (Proxy == null)
-                AddedAccount = AccountManager.AddAccount(SecurityToken.Value, Password);
-            else
-            {
-                string accountJson = null;
-
-                try
-                {
-                    accountJson = await page.EvaluateFunctionAsync<string>("() => fetch('/my/account/json', { credentials: 'include' }).then(x => x.text())");
-                }
-                catch { }
-
-                AddedAccount = AccountManager.AddAccount(SecurityToken.Value, Password, accountJson);
-            }
+            Account AddedAccount = AccountManager.AddAccount(SecurityToken.Value, Password, accountJson);
 
             if (AddedAccount == null)
             {
-                Program.Logger.Warn("[AccountBrowser] Cookie captured but account import failed.");
+                LogImportRetryFailure();
                 return false;
             }
 
             Program.Logger.Info($"[AccountBrowser] Added account via cookie capture: {AddedAccount.Username}");
 
+            AccountCaptured = true;
             Password = null;
 
-            try { await browser.DisposeAsync(); } catch { }
+            await CloseBrowserAfterCapture();
 
             return true;
         }
