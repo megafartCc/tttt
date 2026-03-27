@@ -30,6 +30,8 @@ namespace RBX_Alt_Manager.Classes
         private readonly HashSet<string> Solved = new HashSet<string>();
         private ProxyClient Proxy = null;
         private string Password;
+        private bool AccountCaptured;
+        private bool AccountCaptureInProgress;
 
         public Browser browser;
         public Page page;
@@ -181,7 +183,9 @@ namespace RBX_Alt_Manager.Classes
 
         public async Task LoginTask(Page page, string Username = "", string Password = "")
         {
-            page.RequestFinished += Page_RequestFinished;
+            AccountCaptured = false;
+            AccountCaptureInProgress = false;
+            MonitorLoginCompletion().Forget("AccountBrowser.MonitorLoginCompletion");
 
             await page.EvaluateExpressionAsync(@"document.body.classList.remove(""light-theme"");document.body.classList.add(""dark-theme"");");
 
@@ -320,6 +324,73 @@ namespace RBX_Alt_Manager.Classes
             }
         }
 
+        private async Task MonitorLoginCompletion()
+        {
+            while (browser?.IsConnected == true && page != null && !page.IsClosed && !AccountCaptured)
+            {
+                try
+                {
+                    await TryCapturePasswordFromPage();
+
+                    if ((await page.GetCookiesAsync("https://roblox.com/")).FirstOrDefault(Cookie => Cookie.Name == ".ROBLOSECURITY") is CookieParam cookie
+                        && !string.IsNullOrWhiteSpace(cookie.Value))
+                    {
+                        if (!AccountCaptureInProgress)
+                        {
+                            AccountCaptureInProgress = true;
+
+                            if (await AddAccount(cookie))
+                            {
+                                AccountCaptured = true;
+                                return;
+                            }
+
+                            AccountCaptureInProgress = false;
+                        }
+                    }
+                }
+                catch (PuppeteerException x) when (IsRedirectResponseException(x))
+                {
+                    Program.Logger.Warn("[AccountBrowser] Ignoring redirect response while monitoring login completion.");
+                }
+                catch (Exception x)
+                {
+                    Program.Logger.Warn($"[AccountBrowser] MonitorLoginCompletion failed: {x.Message}");
+                }
+
+                try { await Task.Delay(500); } catch { return; }
+            }
+        }
+
+        private async Task TryCapturePasswordFromPage()
+        {
+            if (page == null || page.IsClosed)
+                return;
+
+            try
+            {
+                string password = await page.EvaluateExpressionAsync<string>(
+                    @"(() => {
+                        const selectors = ['#login-password', '#signup-password', 'input[name=""password""]'];
+                        for (const selector of selectors) {
+                            const element = document.querySelector(selector);
+                            if (element && element.value)
+                                return element.value;
+                        }
+
+                        return '';
+                    })()");
+
+                if (!string.IsNullOrWhiteSpace(password))
+                    Password = password;
+            }
+            catch (PuppeteerException x) when (IsRedirectResponseException(x))
+            {
+                Program.Logger.Warn("[AccountBrowser] Ignoring redirect response while capturing password.");
+            }
+            catch { }
+        }
+
         private async void Page_RequestFinished(object sender, RequestEventArgs e)
         {
             try
@@ -331,19 +402,15 @@ namespace RBX_Alt_Manager.Classes
                 if (e.Request.Method != HttpMethod.Post || !string.Equals(Url.Host, "auth.roblox.com", StringComparison.OrdinalIgnoreCase))
                     return;
 
-                if (e.Request.Response == null || e.Request.Response.Status != HttpStatusCode.OK)
-                    return;
-
                 if ((Url.AbsolutePath == "/v2/login" || Url.AbsolutePath == "/v2/signup") && e.Request.PostData != null && Utilities.TryParseJson((string)e.Request.PostData, out JObject LoginData))
                 {
                     if (LoginData?["password"]?.Value<string>() is string password && !string.IsNullOrEmpty(password) && LoginData?["ctype"].Value<string>() is string loginType && loginType.ToLowerInvariant() == "username")
                         Password = password;
-
-                    if ((await page.GetCookiesAsync("https://roblox.com/")).FirstOrDefault(Cookie => Cookie.Name == ".ROBLOSECURITY") is CookieParam Cookie)
-                        await AddAccount(Cookie);
                 }
-                else if (Regex.IsMatch(Url.AbsolutePath, "/users/[0-9]+/two-step-verification/login") && (await page.GetCookiesAsync("https://roblox.com/")).FirstOrDefault(Cookie => Cookie.Name == ".ROBLOSECURITY") is CookieParam Cookie)
-                    await AddAccount(Cookie);
+                else if (Regex.IsMatch(Url.AbsolutePath, "/users/[0-9]+/two-step-verification/login"))
+                {
+                    await TryCapturePasswordFromPage();
+                }
             }
             catch (PuppeteerException x) when (IsRedirectResponseException(x))
             {
@@ -355,19 +422,41 @@ namespace RBX_Alt_Manager.Classes
             }
         }
 
-        private async Task AddAccount(CookieParam SecurityToken)
+        private async Task<bool> AddAccount(CookieParam SecurityToken)
         {
+            if (SecurityToken == null || string.IsNullOrWhiteSpace(SecurityToken.Value))
+                return false;
+
+            Account AddedAccount;
+
             if (Proxy == null)
-                AccountManager.AddAccount(SecurityToken.Value, Password);
+                AddedAccount = AccountManager.AddAccount(SecurityToken.Value, Password);
             else
             {
-                await page.WaitForNavigationAsync();
-                AccountManager.AddAccount(SecurityToken.Value, Password, await page.EvaluateFunctionAsync<string>("() => { return fetch('/my/account/json').then(x=>x.text()); }"));
+                string accountJson = null;
+
+                try
+                {
+                    accountJson = await page.EvaluateFunctionAsync<string>("() => fetch('/my/account/json', { credentials: 'include' }).then(x => x.text())");
+                }
+                catch { }
+
+                AddedAccount = AccountManager.AddAccount(SecurityToken.Value, Password, accountJson);
             }
+
+            if (AddedAccount == null)
+            {
+                Program.Logger.Warn("[AccountBrowser] Cookie captured but account import failed.");
+                return false;
+            }
+
+            Program.Logger.Info($"[AccountBrowser] Added account via cookie capture: {AddedAccount.Username}");
 
             Password = null;
 
-            await browser.DisposeAsync();
+            try { await browser.DisposeAsync(); } catch { }
+
+            return true;
         }
 
         public static void CreateGrid(Vector2 Size)
